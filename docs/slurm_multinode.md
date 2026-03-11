@@ -60,28 +60,29 @@ python scripts/fetch_data.py  # Creates data/train.jsonl, data/val.jsonl, data/t
 We provide ready-made SLURM scripts. The architecture is:
 
 ```
-submit_grpo.sh  →  sets CONTAINER, MOUNTS, COMMAND  →  sbatch ray_1node.sub
-                                                            │
-                                                            ├── SLURM allocates 1 node × 8 GPUs
-                                                            ├── Starts Ray head inside NeMo RL container
-                                                            ├── Waits for all GPUs online
-                                                            └── Runs run_grpo_cql.py
+grpo.sh / sft.sh
+    │
+    ├── SLURM allocates 1 node × 8 GPUs
+    ├── Starts Ray head inside NeMo RL container
+    ├── Waits for all GPUs online
+    └── Runs run_grpo_cql.py / run_sft_cql.py
 ```
 
 **SFT warmup (optional but recommended):**
 ```bash
-bash scripts/slurm/submit_sft.sh
+sbatch scripts/slurm/sft.sh
 ```
 
 **GRPO training:**
 ```bash
-bash scripts/slurm/submit_grpo.sh
+sbatch scripts/slurm/grpo.sh
 ```
 
 **With overrides:**
 ```bash
-bash scripts/slurm/submit_grpo.sh --steps 100 --lr 1e-5
-bash scripts/slurm/submit_grpo.sh ++grpo.num_generations_per_prompt=16
+OVERRIDES="++grpo.max_num_steps=100" sbatch scripts/slurm/grpo.sh
+OVERRIDES="++grpo.num_generations_per_prompt=16" sbatch scripts/slurm/grpo.sh
+CONFIG=configs/cql_nemo_rl_config.yaml sbatch scripts/slurm/grpo.sh
 ```
 
 ### 4. Monitor

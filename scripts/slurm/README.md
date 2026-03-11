@@ -30,7 +30,7 @@ Teaches the model basic CQL syntax before reward-driven training:
 
 ```bash
 # Submit SFT job — one command!
-bash scripts/slurm/submit_sft.sh
+sbatch scripts/slurm/sft.sh
 ```
 
 ### Step 2: GRPO Training
@@ -39,26 +39,26 @@ The main reinforcement learning step:
 
 ```bash
 # Submit GRPO job — one command!
-bash scripts/slurm/submit_grpo.sh
+sbatch scripts/slurm/grpo.sh
 ```
 
 ### Common Overrides
 
 ```bash
 # Change number of training steps:
-bash scripts/slurm/submit_grpo.sh --steps 100
+OVERRIDES="++grpo.max_num_steps=100" sbatch scripts/slurm/grpo.sh
 
 # Change learning rate:
-bash scripts/slurm/submit_grpo.sh --lr 1e-5
+OVERRIDES="++optimizer.lr=1e-5" sbatch scripts/slurm/grpo.sh
 
 # Use different config (e.g., small model for testing):
-bash scripts/slurm/submit_grpo.sh --config configs/cql_nemo_rl_config.yaml
+CONFIG=configs/cql_nemo_rl_config.yaml sbatch scripts/slurm/grpo.sh
 
 # Multiple overrides (Hydra-style):
-bash scripts/slurm/submit_grpo.sh ++grpo.num_generations_per_prompt=16 ++loss_fn.reference_policy_kl_penalty=0.001
+OVERRIDES="++grpo.num_generations_per_prompt=16 ++loss_fn.reference_policy_kl_penalty=0.001" sbatch scripts/slurm/grpo.sh
 
 # Use different container:
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0 bash scripts/slurm/submit_grpo.sh
+CONTAINER=nvcr.io/nvidia/nemo-rl:v0.6.0 sbatch scripts/slurm/grpo.sh
 ```
 
 ## Monitoring Your Job
@@ -83,29 +83,27 @@ scancel <JOB_ID>
 ## What the Scripts Do
 
 ```
-submit_grpo.sh / submit_sft.sh
+grpo.sh / sft.sh
     │
-    ├── Sets CONTAINER, MOUNTS, COMMAND environment variables
+    ├── Sets CONTAINER, MOUNTS, PYTHONPATH environment variables
     │
-    └── sbatch ray_1node.sub
-            │
-            ├── SLURM allocates 1 node with 8 GPUs
-            ├── Starts Ray head node inside the NeMo RL container
-            ├── Waits for all GPUs to be online
-            └── Runs your training script (run_grpo_cql.py or run_sft_cql.py)
+    ├── SLURM allocates 1 node with 8 GPUs
+    ├── Starts Ray head node inside the NeMo RL container
+    ├── Waits for all GPUs to be online
+    └── Runs your training script (run_grpo_cql.py or run_sft_cql.py)
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `ray_1node.sub` | SLURM job script — launches Ray + container (1 node) |
-| `submit_grpo.sh` | One-command wrapper for GRPO training |
-| `submit_sft.sh` | One-command wrapper for SFT training |
+| `grpo.sh` | SLURM job script for GRPO training (1 node × 8 GPUs) |
+| `sft.sh` | SLURM job script for SFT warmup (1 node × 8 GPUs) |
+| `ray_1node.sub` | Shared SLURM template (used by grpo.sh and sft.sh) |
 
 ## Cluster Configuration
 
-Edit the `#SBATCH` directives in `ray_1node.sub` for your cluster:
+Edit the `#SBATCH` directives in `grpo.sh` / `sft.sh` for your cluster:
 
 ```bash
 #SBATCH --account=YOUR_ACCOUNT      # Your SLURM account
