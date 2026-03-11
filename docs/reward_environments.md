@@ -50,12 +50,13 @@ class MyRewardEnv(EnvironmentInterface[MyMetadata]):
         **kwargs,
     ) -> EnvironmentReturn[MyMetadata]:
         rewards = []
+        responses = []
         for conversation, meta in zip(message_log_batch, metadata):
             # Extract the model's response (last assistant message)
-            response = ""
-            for msg in conversation:
-                if msg["role"] == "assistant":
-                    response += str(msg["content"])
+            response = "".join(
+                str(m["content"]) for m in conversation if m["role"] == "assistant"
+            )
+            responses.append(response)
 
             # ---- YOUR REWARD LOGIC HERE ----
             score = self.compute_reward(response, meta["ground_truth"])
@@ -68,6 +69,7 @@ class MyRewardEnv(EnvironmentInterface[MyMetadata]):
             {"role": "environment", "content": f"reward={r:.2f}"}
             for r in rewards
         ]
+        answers = [r.strip() for r in responses]
 
         return EnvironmentReturn(
             observations=observations,
@@ -75,6 +77,7 @@ class MyRewardEnv(EnvironmentInterface[MyMetadata]):
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards_t,
             terminateds=terminateds,
+            answers=answers,
         )
 
     def compute_reward(self, response: str, ground_truth: str) -> float:
@@ -139,6 +142,7 @@ That's it. NeMo RL handles actor creation, batching, and lifecycle.
 | `next_stop_strings` | `list[None]` | Stop strings for next turn (`[None]*N` for single-turn) |
 | `rewards` | `torch.Tensor` | Shape `[batch_size]`, **must be on CPU** |
 | `terminateds` | `torch.Tensor` | Shape `[batch_size]`, 1.0 = episode done |
+| `answers` | `list[str]` | Extracted answers (model responses or post-processed text) |
 
 **Typical pattern for single-turn reward (most common):**
 ```python
@@ -340,21 +344,18 @@ tensorboard --logdir logs/ --port 6006
 
 ## Existing Example: CQL Environment
 
-See `environments/cql_environment.py` — binary syntax validation reward (~80 lines). This is the simplest possible environment and a good starting point.
+See `environments/cql_environment.py` — R1-style multi-component reward (~98 lines):
+- **Format reward** (0.2 weight): `<think>...</think>` tag presence → 0.0 / 0.5 / 1.0
+- **N-gram reward** (0.8 weight): bigram F1 vs reference CQL using semantic tokenizer
+- **Execution reward** (0.0 weight): placeholder for Docker LogScale compilation
 
-To extend it with ngram similarity:
+Reward logic lives in `utils/cql_rewards.py` (pure Python, no GPU deps — testable on Mac).
 
 ```python
-from utils.cql_tokenizer import bigram_similarity
+from utils.cql_rewards import compute_combined_reward
 
-def compute_reward(self, response, ground_truth):
-    result = validate(response)
-    sim = bigram_similarity(response, ground_truth)
-
-    if not result.is_valid:
-        return max(-0.5 + 0.1 * sim, -1.0)  # invalid: hard penalty
-
-    return 0.4 + 0.6 * sim  # valid: base + similarity bonus
+result = compute_combined_reward(response, reference_cql, weights={"format": 0.2, "ngram": 0.8, "execution": 0.0})
+# result = {"reward": 0.84, "format": 1.0, "ngram": 0.8, "execution": 0.0, "extracted_cql": "...", "has_thinking": True}
 ```
 
 ---
@@ -363,9 +364,10 @@ def compute_reward(self, response, ground_truth):
 
 - [ ] Class decorated with `@ray.remote(max_restarts=-1, max_task_retries=-1)`
 - [ ] Inherits `EnvironmentInterface[YourMetadata]`
-- [ ] `step()` returns `EnvironmentReturn` with CPU tensors
+- [ ] `step()` returns `EnvironmentReturn` with **all 6 fields** including `answers`
+- [ ] All tensors (`rewards`, `terminateds`) on **CPU**
 - [ ] `global_post_process_and_metrics()` multiplies `rewards * is_end`
 - [ ] `shutdown()` method exists (can be empty)
 - [ ] Registered via `register_env("name", "module.ClassName")` before training starts
 - [ ] Config YAML has `env: your_name: num_workers: N`
-- [ ] Rewards bounded and consistent (invalid < valid)
+- [ ] Rewards bounded and consistent
