@@ -234,6 +234,7 @@ cql_rlvr/
 
 | Doc | What it covers |
 |-----|---------------|
+| **[Local Setup](docs/local_setup.md)** | **Start here — Mac/laptop dev setup, testing rewards, troubleshooting** |
 | [Hyperparameters](docs/hyperparameters.md) | Every tunable param — GRPO, optimizer, LoRA, vLLM, scheduler |
 | [Reward Environments](docs/reward_environments.md) | How to build custom rewards, patterns, templates |
 | [GRPO Algorithms](docs/grpo_algorithms.md) | GRPO vs GSPO vs DAPO deep-dive |
