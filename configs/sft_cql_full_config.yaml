@@ -1,0 +1,156 @@
+# NeMo RL SFT Configuration — CQL Full Fine-Tuning (No LoRA)
+#
+# Full parameter SFT warmup on CQL data before GRPO reinforcement learning.
+# Based on NVIDIA-NeMo/RL/examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml
+#
+# Usage:
+#   uv run python scripts/run_sft_cql.py --config configs/sft_cql_full_config.yaml
+#   uv run python scripts/run_sft_cql.py --config configs/sft_cql_full_config.yaml ++sft.max_num_steps=300
+#
+# Memory estimate per GPU with FSDP2 (1×8 B200):
+#   Model + optimizer + gradients: ~45 GB → 147 GB headroom per B200
+#
+# For LoRA variant (lower memory): use sft_cql_config.yaml
+
+# ============================================================================
+# SFT Algorithm Configuration
+# ============================================================================
+sft:
+  max_num_epochs: 3
+  max_num_steps: 200
+  val_period: 20
+  val_batches: 8
+  val_global_batch_size: 16
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: true
+  seed: 42
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_cql_full"
+  metric_name: "val:val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# ============================================================================
+# Policy (Model) — Full Fine-Tuning
+# ============================================================================
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # Instruct tokenizer (has chat template)
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  offload_optimizer_for_logprob: false
+
+  # ── DTensor (FSDP2) — NO LoRA ──
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true    # Recommended for full-FT 30B
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    # LoRA DISABLED — full parameter fine-tuning
+    lora_cfg:
+      enabled: false
+
+  megatron_cfg:
+    enabled: false
+
+  sequence_packing:
+    enabled: false                    # Mamba2 + MoE + packing not validated
+
+  dynamic_batching:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+
+  # Optimizer — slightly lower LR for full-FT SFT
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-5                      # Lower than LoRA SFT (2e-5) since updating all params
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: false
+      fused: false
+
+  # ── LR Scheduler ──
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+# ============================================================================
+# Data — CQL JSONL with custom processor
+# ============================================================================
+data:
+  max_input_seq_length: 2048
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 4
+
+  train:
+    data_path: "data/train.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  validation:
+    data_path: "data/val.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  default:
+    dataset_name: "ResponseDataset"
+    prompt_file: null
+    system_prompt_file: "resources/cql_system_prompt.txt"
+    processor: "cql_data_processor"
+
+# ============================================================================
+# Logger
+# ============================================================================
+logger:
+  log_dir: "logs"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  tensorboard:
+    log_dir: "tb_logs-sft-cql-full"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# ============================================================================
+# Cluster — 1 node × 8 B200 GPUs
+# ============================================================================
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

@@ -1,0 +1,62 @@
+# NeMo Gym Configuration for CQL RLVR
+# Resource server for NL-to-CQL query generation training
+
+cql_resources_server:
+  resources_servers:
+    cql_resource:
+      entrypoint: resources/cql_resource_server.py
+      domain: coding  # CQL generation is closest to coding domain
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 8080
+  num_workers: 1  # Dummy run: 1 worker. Production: set to 4-8 for multi-GPU training.
+
+# Dataset configuration
+dataset:
+  type: jsonl
+  path: data/train.jsonl
+  prompt_field: nl_query
+  answer_field: cql_query
+  shuffle: true
+  seed: 42
+
+# Prompt template — user message only (system prompt is in system_prompt_file).
+# In production NeMo RL, the system prompt is injected via chat template.
+# This template is for reference/the resource server fallback.
+prompt_template: |
+  Schema: {schema_context}
+  Request: {nl_query}
+
+# System prompt file — loaded by NeMo RL and the resource server.
+system_prompt_file: resources/cql_system_prompt.txt
+
+# Reward configuration
+# These weights match DEFAULT_REWARD_WEIGHTS in cql_resource_server.py.
+# Each component returns [0, 1], combined via weighted sum.
+reward:
+  type: custom
+  module: resources.cql_resource_server
+  components:
+    - name: syntax
+      weight: 0.4
+      description: "CQL syntax validation — binary 0/1"
+    - name: execution
+      weight: 0.3
+      description: "Query execution — binary 0/1 (mock: 80% success rate)"
+    - name: ngram
+      weight: 0.3
+      description: "Bigram similarity to golden CQL — continuous [0, 1]"
+
+  # Hard invariant: syntax_weight > ngram_weight guarantees
+  # invalid queries never outscore valid ones.
+  invariants:
+    invalid_never_beats_valid: true
+
+# Rollout settings
+rollout:
+  num_rollouts_per_prompt: 4
+  max_response_length: 512
+  temperature: 0.8
+  top_p: 0.95

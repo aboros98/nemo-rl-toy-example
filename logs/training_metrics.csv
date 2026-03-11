@@ -1,0 +1,4 @@
+step,reward_mean,reward_std,reward_min,reward_max,syntax_valid_pct,exec_success_pct,ngram_sim_mean,step_time_s,num_generations
+1,0.4941,0.2523,0.0,0.7462,50.0,50.0,0.4802,0.21,16
+2,0.4029,0.3198,0.0,1.0,31.2,25.0,0.6764,0.0,16
+3,0.3507,0.3219,0.0,1.0,31.2,25.0,0.5023,0.0,16

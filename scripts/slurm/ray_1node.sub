@@ -1,0 +1,170 @@
+#!/bin/bash
+# ===========================================================================
+# ray_1node.sub — SLURM script to launch Ray + NeMo RL on 1 node
+#
+# Simplified version of NVIDIA-NeMo/RL/ray.sub for single-node training.
+# No multi-node worker logic needed.
+#
+# How it works:
+#   1. SLURM allocates 1 node with 8 GPUs
+#   2. Starts Ray head node inside NeMo RL container
+#   3. Waits for Ray to be ready
+#   4. Runs your COMMAND (e.g., GRPO or SFT training script)
+#
+# Usage:
+#   CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0 \
+#   MOUNTS="/path/to/cql_rlvr:/workspace/cql_rlvr" \
+#   COMMAND="uv run python /workspace/cql_rlvr/scripts/run_grpo_cql.py --config /workspace/cql_rlvr/configs/cql_nemo_rl_nemotron30b.yaml" \
+#   sbatch scripts/slurm/ray_1node.sub
+# ===========================================================================
+
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --job-name=cql-rlvr
+#SBATCH --time=4:00:00
+#SBATCH --output=logs/slurm-%j.out
+#SBATCH --error=logs/slurm-%j.err
+
+# ── Uncomment and set these for your cluster ──
+# #SBATCH --account=YOUR_ACCOUNT
+# #SBATCH --partition=YOUR_PARTITION
+
+set -eoux pipefail
+
+# ============================================================================
+# User-configurable variables (set before sbatch or override via env)
+# ============================================================================
+CONTAINER=${CONTAINER:-"nvcr.io/nvidia/nemo-rl:v0.5.0"}
+MOUNTS=${MOUNTS:-"$(pwd):/workspace/cql_rlvr"}
+COMMAND=${COMMAND:-""}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+# ============================================================================
+# Ray ports (no conflicts on single node)
+# ============================================================================
+PORT=${PORT:-54514}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+
+# Disable uv runtime env (performance)
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+# ============================================================================
+# Setup
+# ============================================================================
+LOG_DIR="${SLURM_SUBMIT_DIR}/logs/${SLURM_JOB_ID}"
+mkdir -p "$LOG_DIR"
+
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+head_node_ip=$(getent hosts "$head_node" 2>/dev/null | awk '{print $1}' | head -1 || echo "$head_node")
+
+echo "[INFO] Job ID: $SLURM_JOB_ID"
+echo "[INFO] Node: $head_node ($head_node_ip)"
+echo "[INFO] GPUs: $GPUS_PER_NODE"
+echo "[INFO] Container: $CONTAINER"
+echo "[INFO] Command: $COMMAND"
+
+# Increase file descriptors (Ray recommendation)
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+    ulimit -Sn 65535
+fi
+
+# ============================================================================
+# Common srun arguments
+# ============================================================================
+SRUN_ARGS="--no-container-mount-home"
+SRUN_ARGS+=" --container-mounts=$MOUNTS"
+SRUN_ARGS+=" --container-image=$CONTAINER"
+SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+
+# Detect GRES from job allocation (preferred) or fall back to requested count
+if [[ -n "${SLURM_GPUS_PER_NODE:-}" ]]; then
+    SRUN_ARGS+=" --gres=gpu:${SLURM_GPUS_PER_NODE}"
+elif [[ "$GPUS_PER_NODE" -gt 0 ]]; then
+    SRUN_ARGS+=" --gres=gpu:${GPUS_PER_NODE}"
+fi
+
+# ============================================================================
+# Start Ray head (background)
+# ============================================================================
+echo "[INFO] Starting Ray head node..."
+
+head_cmd="
+ray start --head \
+    --disable-usage-stats \
+    --resources='{\"worker_units\": $GPUS_PER_NODE}' \
+    --node-ip-address=\"$head_node_ip\" \
+    --port=$PORT \
+    --ray-client-server-port=$RAY_CLIENT_SERVER_PORT \
+    --dashboard-port=$DASHBOARD_PORT \
+    --dashboard-host=\"$head_node_ip\" \
+    --include-dashboard=True \
+    --block
+"
+
+srun $SRUN_ARGS \
+    --container-name=ray-head \
+    --nodes=1 --ntasks=1 \
+    -w "$head_node" \
+    -o "$LOG_DIR/ray-head.log" \
+    bash -c "touch $LOG_DIR/STARTED && $head_cmd" &
+RAY_HEAD_PID=$!
+
+# Wait for Ray head to start
+echo "[INFO] Waiting for Ray head..."
+for i in $(seq 1 60); do
+    if [[ -f "$LOG_DIR/STARTED" ]]; then
+        break
+    fi
+    if ! kill -0 "$RAY_HEAD_PID" 2>/dev/null; then
+        echo "[ERROR] Ray head process died"
+        exit 1
+    fi
+    sleep 2
+done
+
+# Wait for Ray to report all GPUs online
+echo "[INFO] Waiting for all $GPUS_PER_NODE GPUs to be online..."
+for i in $(seq 1 60); do
+    worker_units=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 \
+        -w "$head_node" ray status 2>/dev/null | grep "worker_units" | \
+        sed -E 's/.*worker_units: ([0-9]+).*/\1/' || echo 0)
+    if [[ "$worker_units" -eq "$GPUS_PER_NODE" ]]; then
+        echo "[INFO] All $GPUS_PER_NODE GPUs online!"
+        break
+    fi
+    echo "[INFO] GPUs online: $worker_units/$GPUS_PER_NODE"
+    sleep 5
+done
+
+# Verify Ray API is fully responsive before launching training
+echo "[INFO] Verifying Ray API readiness..."
+for i in $(seq 1 30); do
+    if srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 \
+        -w "$head_node" ray list nodes 2>/dev/null | grep -q "ALIVE"; then
+        echo "[INFO] Ray API ready!"
+        break
+    fi
+    sleep 2
+done
+
+# ============================================================================
+# Run training command
+# ============================================================================
+if [[ -n "$COMMAND" ]]; then
+    echo "[INFO] Running: $COMMAND"
+    srun --overlap \
+        --container-name=ray-head \
+        --container-workdir="$SLURM_SUBMIT_DIR" \
+        --nodes=1 --ntasks=1 \
+        -w "$head_node" \
+        -o "$LOG_DIR/driver.log" \
+        bash -c "$COMMAND"
+    echo "[INFO] Training complete! Logs: $LOG_DIR/"
+else
+    echo "[INFO] No COMMAND set. Ray cluster is idle."
+    echo "[INFO] Attach: srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w $head_node --jobid $SLURM_JOB_ID --pty bash"
+    sleep infinity
+fi

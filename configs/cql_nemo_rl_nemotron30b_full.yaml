@@ -1,0 +1,242 @@
+# NeMo RL GRPO Configuration — Nemotron-3-Nano-30B-A3B FULL FINE-TUNING
+#
+# Full parameter update (no LoRA) on 1 node × 8 B200 GPUs.
+# Based on NVIDIA's official recipe:
+#   github.com/NVIDIA-NeMo/RL/.../grpo-nanov3-30BA3B-2n8g-fsdp2.yaml
+#
+# Adapted from 2 nodes × 8 GPUs (80GB) → 1 node × 8 B200 GPUs (192GB).
+#
+# Memory estimate per GPU with FSDP2:
+#   Model weights (bf16):     ~7.5 GB  (60GB / 8 GPUs)
+#   Optimizer states (fp32):  ~30  GB  (240GB / 8 GPUs)
+#   Gradients (bf16):         ~7.5 GB  (60GB / 8 GPUs)
+#   Total:                    ~45  GB  → 147 GB headroom on B200
+#
+# For LoRA variant (lower memory, faster): use cql_nemo_rl_nemotron30b.yaml
+
+# ============================================================================
+# GRPO Algorithm Configuration
+# ============================================================================
+grpo:
+  num_prompts_per_step: 2           # Official recipe value
+  num_generations_per_prompt: 8     # 8 rollouts per prompt
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 500
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 25
+  val_at_start: false
+  val_at_end: true
+  overlong_filtering: false
+  max_val_samples: 64
+  val_batch_size: 64
+  seed: 42
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+
+  reward_scaling:
+    enabled: false
+
+  async_grpo:
+    enabled: false
+
+  seq_logprob_error_threshold: null
+
+# ============================================================================
+# Loss Function
+# ============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2               # Symmetric clipping (official default)
+  ratio_clip_max: 0.2               # Symmetric clipping (official default)
+  # ── Alternative: Asymmetric "Clip-Higher" for positive advantages ──
+  # ratio_clip_max: 0.28            # upper bound 1.28 vs lower 0.8
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/cql_grpo_nemotron30b_full"
+  metric_name: "train:reward_mean"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 25
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# ============================================================================
+# Policy (Model) — Full Fine-Tuning
+# ============================================================================
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    # Instruct tokenizer — has chat template needed by cql_data_processor
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 16        # 2 prompts × 8 generations
+  train_micro_batch_size: 1          # Must be 1 for 30B MoE
+  generation_batch_size: 16
+  logprob_batch_size: 1
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+
+  # ── DTensor (FSDP2) — NO LoRA ──
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false               # B200 has 192GB — no need for CPU offload
+    # ── Uncomment to reduce GPU memory by offloading to CPU RAM ──
+    # cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true   # Recommended for full-FT with 30B optimizer states
+    tensor_parallel_size: 1          # DP-only for training (FSDP2 shards across all GPUs)
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    # LoRA DISABLED — full parameter fine-tuning
+    lora_cfg:
+      enabled: false
+
+  megatron_cfg:
+    enabled: false
+
+  sequence_packing:
+    enabled: false                   # Mamba2 + MoE + packing not validated
+
+  dynamic_batching:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1
+
+  # ── Optimizer ──
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6                     # Same LR as LoRA (official recipe)
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false                  # Required for DTensor
+      fused: false                    # Required for DTensor
+
+  # ── LR Scheduler: warmup → constant ──
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  # ── Generation (vLLM) ──
+  generation:
+    backend: "vllm"
+    max_new_tokens: 512
+    temperature: 0.8                 # CQL is more constrained than math (official default: 1.0)
+    top_p: 0.95
+    top_k: null
+    stop_strings: ["\n\n", "```", "Explanation:", "Note:"]
+    vllm_cfg:
+      async_engine: false
+      precision: "bfloat16"
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 4        # 30B MoE needs TP=4 for generation
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_model_len: 2048
+      enforce_eager: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        use_inductor: false
+    colocated:
+      enabled: true
+
+# ============================================================================
+# Data
+# ============================================================================
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  use_multiple_dataloader: false
+  train:
+    data_path: "data/train.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  validation:
+    data_path: "data/val.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  default:
+    dataset_name: "ResponseDataset"
+    prompt_file: null
+    system_prompt_file: "resources/cql_system_prompt.txt"
+    processor: "cql_data_processor"
+    env_name: "cql"
+
+# ============================================================================
+# Environment (CQL Resource Server)
+# ============================================================================
+env:
+  cql:
+    num_workers: 8
+    reward_server_url: "http://localhost:8080"
+    reward_endpoint: "/compute_rewards"
+    verify_endpoint: "/verify"
+    health_endpoint: "/health"
+
+# ============================================================================
+# Logger
+# ============================================================================
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 2
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "cql-rlvr"
+    name: "grpo-nemotron30b-full-cql"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# ============================================================================
+# Cluster — 1 node × 8 B200 GPUs
+# ============================================================================
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

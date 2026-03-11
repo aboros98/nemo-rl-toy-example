@@ -1,0 +1,276 @@
+# NeMo RL GRPO Configuration — Nemotron-3-Nano-30B-A3B on 1×8 B200
+#
+# PRODUCTION config for CQL RLVR training.
+# Based on NVIDIA's official recipe:
+#   github.com/NVIDIA-NeMo/RL/.../grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml
+#
+# Adapted from 2 nodes × 8 GPUs → 1 node × 8 B200 GPUs (192GB HBM3e each).
+#
+# Model: Nemotron-3-Nano-30B-A3B — 30B total / 3.6B active MoE
+#   Architecture: 23 MoE/Mamba-2 layers + 6 GQA attention layers
+#   128 routed experts + 1 shared expert, 6 active per token
+#   Hidden dim: 2688
+#
+# CRITICAL: LoRA must exclude *out_proj* modules — Mamba2's
+# NemotronHMamba2Mixer out_proj has ZERO gradient with cuda_kernels_forward.
+# Applying LoRA to these modules causes silent training failure.
+
+# ============================================================================
+# GRPO Algorithm Configuration
+# ============================================================================
+grpo:
+  num_prompts_per_step: 2           # Official recipe value (conservative for 8 GPUs)
+  num_generations_per_prompt: 8     # 8 rollouts per prompt
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 500                # Production run — adjust as needed
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 25
+  val_at_start: false
+  val_at_end: true
+  overlong_filtering: false
+  max_val_samples: 64
+  val_batch_size: 64
+  seed: 42
+  use_dynamic_sampling: true        # Filter zero-variance groups
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+
+  reward_scaling:
+    enabled: false
+
+  async_grpo:
+    enabled: false
+
+  seq_logprob_error_threshold: null
+
+# ============================================================================
+# Loss Function
+# ============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.01   # Light KL penalty for production
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2                 # lower bound = 1 - 0.2 = 0.8
+  ratio_clip_max: 0.2                 # upper bound = 1 + 0.2 = 1.2 (official default, symmetric)
+  # ── Alternative: Asymmetric "Clip-Higher" — wider upper clip for positive advantages ──
+  # ratio_clip_max: 0.28              # upper bound = 1 + 0.28 = 1.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  token_level_loss: true              # Token-level loss (better for variable-length CQL)
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/cql_grpo_nemotron30b"
+  metric_name: "train:reward_mean"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 25
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# ============================================================================
+# Policy (Model) Configuration
+# ============================================================================
+policy:
+  # Nemotron-3-Nano-30B-A3B — Base model for RL fine-tuning
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    # Instruct tokenizer (has chat template) — different from base model name
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 16        # 2 prompts × 8 generations
+  train_micro_batch_size: 1          # Must be 1 for 30B MoE
+  generation_batch_size: 16
+  logprob_batch_size: 1              # Conservative for MoE
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  max_total_sequence_length: 2048    # CQL queries + context
+  precision: "bfloat16"
+  max_grad_norm: 1.0
+
+  # ── DTensor (FSDP2) — shards model across all 8 GPUs ──
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false   # B200 has 192GB, not needed
+    tensor_parallel_size: 1           # DP-only for training (FSDP2 shards across all GPUs)
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    # ── LoRA Configuration ──────────────────────────────────────────
+    # CRITICAL: Must exclude *out_proj* for Mamba2 compatibility.
+    # NemotronHMamba2Mixer.out_proj has zero gradient with cuda_kernels_forward.
+    lora_cfg:
+      enabled: true
+      target_modules: []              # Empty — match_all_linear=false means we need to specify, but
+                                      # NeMo RL will apply to all linear EXCEPT excluded modules
+      exclude_modules: ['*out_proj*'] # REQUIRED for Mamba2 — zero gradient modules
+      match_all_linear: false         # Can't use true because we need exclude to work
+      dim: 128                        # Higher rank for 30B model (official recipe)
+      alpha: 512                      # alpha/dim = 4.0 effective scaling
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: false               # REQUIRED: Triton LoRA kernels don't work with Mamba2
+
+  # ── Megatron (disabled — using DTensor/FSDP2) ──
+  megatron_cfg:
+    enabled: false
+
+  # ── Sequence packing DISABLED ──
+  # Official Nemotron-30B recipe has packing off.
+  # Mamba2 + MoE + sequence packing interaction is not yet validated by NVIDIA.
+  sequence_packing:
+    enabled: false
+
+  # ── Dynamic batching also disabled ──
+  dynamic_batching:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1  # No TP for training, no alignment needed
+
+  # ── Optimizer ──
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6                     # Standard RL learning rate
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false                  # Required for DTensor
+      fused: false                    # Required for DTensor
+
+  # ── LR Scheduler ──
+  # Default: warmup → constant (RECOMMENDED for GRPO/RLVR)
+  # Research (DeepSeek-R1, arXiv 2503.06639) shows constant LR is most stable
+  # for KL-regularized GRPO. Cosine decay is an option for long runs (500+ steps).
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20              # Warmup for ~20 steps
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  # ── Alternative: Warmup → Cosine Decay (for long runs, 500+ steps) ──
+  # Uncomment below and comment out the scheduler above:
+  # scheduler:
+  #   - name: "torch.optim.lr_scheduler.LinearLR"
+  #     kwargs:
+  #       start_factor: 0.1
+  #       end_factor: 1.0
+  #       total_iters: 20
+  #   - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+  #     kwargs:
+  #       T_max: 480              # max_num_steps (500) - warmup_iters (20)
+  #       eta_min: 1.0e-7
+  #   - milestones: [20]
+
+  # ── Generation (vLLM) ──
+  generation:
+    backend: "vllm"
+    max_new_tokens: 512              # CQL queries don't need 2048
+    temperature: 0.8                 # Slightly less than math (1.0) — CQL is more constrained
+    top_p: 0.95
+    top_k: null
+    stop_strings: ["\n\n", "```", "Explanation:", "Note:"]  # Prevent post-query rambling
+    vllm_cfg:
+      async_engine: false
+      precision: "bfloat16"
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 4        # 30B MoE needs TP=4 for generation (official recipe)
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7    # Official recipe value
+      max_model_len: 2048
+      enforce_eager: false            # Official recipe — CUDA graphs OK on B200
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"     # REQUIRED for Mamba2 — prevents cache precision errors
+      compilation_config:
+        use_inductor: false                # Use CUDA kernels instead of torch.compile Triton (better accuracy)
+    colocated:
+      enabled: true                   # Share training GPUs for generation
+
+# ============================================================================
+# Data
+# ============================================================================
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4                     # More workers for 8-GPU setup
+  use_multiple_dataloader: false
+  train:
+    data_path: "data/train.jsonl"
+    input_key: "nl_query"            # Natural language question (kept separate from system prompt)
+    output_key: "cql_query"          # Golden CQL/KQL query → extra_env_info for reward
+  validation:
+    data_path: "data/val.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  default:
+    dataset_name: "ResponseDataset"
+    prompt_file: null
+    system_prompt_file: "resources/cql_system_prompt.txt"   # → system role in chat template
+    processor: "cql_data_processor"                         # Custom: proper system/user/assistant roles
+    env_name: "cql"
+
+# ============================================================================
+# Environment (CQL Resource Server)
+# ============================================================================
+env:
+  cql:
+    num_workers: 8                   # Match GPU count
+    reward_server_url: "http://localhost:8080"
+    reward_endpoint: "/compute_rewards"
+    verify_endpoint: "/verify"
+    health_endpoint: "/health"
+
+# ============================================================================
+# Logger — TensorBoard + W&B for production monitoring
+# ============================================================================
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 2
+  wandb_enabled: true
+  tensorboard_enabled: true                    # Both TB and W&B for production
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true                           # Log GPU utilization / memory
+  wandb:
+    project: "cql-rlvr"
+    name: "grpo-nemotron30b-cql"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# ============================================================================
+# Cluster — 1 node × 8 B200 GPUs
+# ============================================================================
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

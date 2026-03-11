@@ -1,0 +1,180 @@
+# NeMo RL SFT Configuration — CQL Supervised Fine-Tuning
+#
+# SFT warmup on CQL data before GRPO reinforcement learning.
+# Based on NVIDIA-NeMo/RL/examples/configs/sft.yaml
+#
+# Usage:
+#   uv run python scripts/run_sft_cql.py --config configs/sft_cql_config.yaml
+#   uv run python scripts/run_sft_cql.py --config configs/sft_cql_config.yaml ++sft.max_num_steps=200
+#
+# This config targets Nemotron-30B-A3B on 1×8 B200 GPUs.
+# For a smaller model (validation), change policy.model_name and reduce batch sizes.
+
+# ============================================================================
+# SFT Algorithm Configuration
+# ============================================================================
+sft:
+  max_num_epochs: 3                   # 3 epochs of SFT warmup
+  max_num_steps: 200                  # Or stop after 200 steps, whichever first
+  val_period: 20
+  val_batches: 8
+  val_global_batch_size: 16
+  val_micro_batch_size: 1
+  val_at_start: true                  # Measure baseline loss before training
+  val_at_end: true
+  seed: 42
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_cql"
+  metric_name: "val:val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# ============================================================================
+# Policy (Model) Configuration
+# ============================================================================
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # Instruct tokenizer (has chat template)
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 16
+  train_micro_batch_size: 1           # Conservative for 30B MoE
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  offload_optimizer_for_logprob: false
+
+  # ── DTensor (FSDP2) ──
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+    # LoRA — higher rank for SFT warmup (official recipe uses dim=256 for SFT vs 128 for GRPO)
+    lora_cfg:
+      enabled: true
+      target_modules: []
+      exclude_modules: ['*out_proj*']   # REQUIRED for Mamba2
+      match_all_linear: false
+      dim: 256                           # Official Nano SFT recipe: dim=256 (more capacity for SFT)
+      alpha: 512
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: false                 # REQUIRED: Triton doesn't work with Mamba2
+
+  megatron_cfg:
+    enabled: false
+
+  # Sequence packing — DISABLED for Mamba2 (official Nano recipes have packing off)
+  # Mamba2 + MoE + sequence packing interaction is not validated by NVIDIA.
+  sequence_packing:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+
+  # Optimizer
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 2.0e-5                       # Higher LR for SFT than GRPO (5e-6)
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      foreach: false
+      fused: false
+
+  # ── LR Scheduler ──
+  # Default: warmup → constant (recommended)
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  # ── Alternative: Warmup → Cosine Decay ──
+  # Uncomment below and comment out the scheduler above:
+  # scheduler:
+  #   - name: "torch.optim.lr_scheduler.LinearLR"
+  #     kwargs:
+  #       start_factor: 0.1
+  #       end_factor: 1.0
+  #       total_iters: 20
+  #   - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+  #     kwargs:
+  #       T_max: 180              # max_num_steps - warmup_iters
+  #       eta_min: 2.0e-7
+  #   - milestones: [20]
+
+# ============================================================================
+# Data — CQL JSONL with custom processor
+# ============================================================================
+data:
+  max_input_seq_length: 2048
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false         # SFT includes the answer, no generation prompt needed
+  shuffle: true
+  num_workers: 4
+
+  train:
+    data_path: "data/train.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  validation:
+    data_path: "data/val.jsonl"
+    input_key: "nl_query"
+    output_key: "cql_query"
+  default:
+    dataset_name: "ResponseDataset"
+    prompt_file: null
+    system_prompt_file: "resources/cql_system_prompt.txt"
+    processor: "cql_data_processor"
+
+# ============================================================================
+# Logger
+# ============================================================================
+logger:
+  log_dir: "logs"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  tensorboard:
+    log_dir: "tb_logs-sft-cql"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# ============================================================================
+# Cluster — 1 node × 8 B200 GPUs
+# ============================================================================
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
