@@ -244,6 +244,10 @@ data:
 env:
   cql:
     num_workers: 8
+    reward_weights:
+      format: 0.2     # <think>...</think> tag compliance (R1 format reward)
+      ngram: 0.8       # bigram F1 vs reference query (accuracy signal)
+      execution: 0.0   # placeholder — set to >0 when Docker LogScale is ready
 
 # ============================================================================
 # Logger — TensorBoard + W&B for production monitoring

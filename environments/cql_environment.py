@@ -1,7 +1,11 @@
-"""CQL reward environment for NeMo RL.
+"""CQL reward environment for NeMo RL — R1-style multi-component rewards.
 
-Minimal environment: valid CQL syntax → 1.0, invalid → 0.0.
-Follows the same pattern as nemo_rl.environments.math_environment.MathEnvironment.
+Three reward components (DeepSeek-R1 pattern):
+  1. N-gram similarity  — bigram F1 vs reference query (accuracy signal)
+  2. Format             — proper <think>...</think> reasoning tags (format signal)
+  3. Execution          — placeholder for Docker LogScale compilation (correctness signal)
+
+Weights are configurable via env config. Default: ngram=0.8, format=0.2, execution=0.0.
 """
 
 import sys
@@ -20,11 +24,12 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from utils.cql_validator import validate
+from utils.cql_rewards import compute_combined_reward
 
 
-class CQLEnvConfig(TypedDict):
+class CQLEnvConfig(TypedDict, total=False):
     num_workers: int
+    reward_weights: dict[str, float]
 
 
 class CQLEnvironmentMetadata(TypedDict):
@@ -33,10 +38,15 @@ class CQLEnvironmentMetadata(TypedDict):
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
-    """Reward = 1.0 if generated CQL is syntactically valid, else 0.0."""
+    """R1-style reward: format (think tags) + n-gram similarity + execution (placeholder)."""
 
     def __init__(self, cfg: CQLEnvConfig):
         self.cfg = cfg
+        self.weights = cfg.get("reward_weights", {
+            "format": 0.2,
+            "ngram": 0.8,
+            "execution": 0.0,
+        })
 
     def shutdown(self) -> None:
         pass
@@ -47,18 +57,23 @@ class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
         metadata: list[CQLEnvironmentMetadata],
         **kwargs,
     ) -> EnvironmentReturn[CQLEnvironmentMetadata]:
-        results = []
-        for conversation in message_log_batch:
+        rewards_list = []
+        answers = []
+
+        for conversation, meta in zip(message_log_batch, metadata):
             response = "".join(
                 str(m["content"]) for m in conversation if m["role"] == "assistant"
             )
-            result = validate(response)
-            results.append(1.0 if result.is_valid else 0.0)
+            reference = meta.get("ground_truth", "")
+            result = compute_combined_reward(response, reference, self.weights)
 
-        rewards = torch.tensor(results).cpu()
+            rewards_list.append(result["reward"])
+            answers.append(result["extracted_cql"])
+
+        rewards = torch.tensor(rewards_list).cpu()
         done = torch.ones_like(rewards).cpu()
         observations = [
-            {"role": "environment", "content": f"reward={r}"} for r in results
+            {"role": "environment", "content": f"reward={r:.3f}"} for r in rewards_list
         ]
 
         return EnvironmentReturn(
@@ -67,7 +82,7 @@ class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards,
             terminateds=done,
-            answers=None,
+            answers=answers,
         )
 
     def global_post_process_and_metrics(
@@ -75,7 +90,7 @@ class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         batch["rewards"] = batch["rewards"] * batch["is_end"]
         metrics = {
-            "accuracy": batch["rewards"].mean().item(),
+            "mean_reward": batch["rewards"].mean().item(),
             "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
             "generation_lengths": batch["generation_lengths"].float().mean().item(),
             "prompt_lengths": batch["prompt_lengths"].float().mean().item(),

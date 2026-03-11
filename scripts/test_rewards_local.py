@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Test reward logic locally on Mac — no GPU, no NeMo RL, no Ray needed.
 
+Uses the EXACT same reward functions as the real CQL environment.
+Edit compute_combined_reward() in environments/cql_environment.py to change rewards —
+this script imports from there, so local tests always match production.
+
 Usage:
     python3 scripts/test_rewards_local.py
     python3 scripts/test_rewards_local.py --data data/train.jsonl --n 20
@@ -14,36 +18,25 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.cql_validator import validate
-from utils.cql_tokenizer import bigram_similarity
+from utils.cql_rewards import (
+    compute_combined_reward,
+    compute_format_reward,
+    extract_cql_from_response,
+)
 
-
-def compute_reward(response: str, ground_truth: str) -> dict:
-    """Same binary logic the CQL environment uses during GRPO training.
-
-    Matches environments/cql_environment.py: valid=1.0, invalid=0.0.
-    Edit this to prototype new reward formulas before deploying.
-    """
-    result = validate(response)
-    sim = bigram_similarity(response, ground_truth)
-
-    # Binary reward — matches actual environment
-    reward = 1.0 if result.is_valid else 0.0
-
-    return {
-        "reward": round(reward, 3),
-        "category": "VALID" if result.is_valid else "INVALID",
-        "is_valid": result.is_valid,
-        "errors": result.errors,
-        "bigram_sim": round(sim, 3),
-    }
+DEFAULT_WEIGHTS = {"format": 0.2, "ngram": 0.8, "execution": 0.0}
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Test CQL rewards locally")
     parser.add_argument("--data", default=str(PROJECT_ROOT / "data" / "train.jsonl"))
-    parser.add_argument("--n", type=int, default=10, help="Number of examples to test")
+    parser.add_argument("--n", type=int, default=10, help="Number of examples")
+    parser.add_argument("--weights", type=str, default=None,
+                        help='JSON weights, e.g. \'{"format":0.2,"ngram":0.8,"execution":0.0}\'')
     args = parser.parse_args()
+
+    weights = json.loads(args.weights) if args.weights else DEFAULT_WEIGHTS
+    print(f"Reward weights: format={weights['format']}, ngram={weights['ngram']}, execution={weights['execution']}\n")
 
     examples = []
     with open(args.data) as f:
@@ -52,46 +45,58 @@ def main():
             if len(examples) >= args.n:
                 break
 
-    print(f"Testing reward on {len(examples)} examples from {args.data}\n")
-    print(f"{'#':>3}  {'Reward':>7}  {'Valid':>5}  {'BiSim':>5}  Query (first 60 chars)")
+    # --- Test 1: ground truth (bare CQL, no think tags) ---
+    print(f"=== Ground truth queries (no <think> tags) — {len(examples)} examples ===")
+    print(f"{'#':>3}  {'Total':>6}  {'Fmt':>5}  {'Ngram':>5}  Query (first 60 chars)")
     print("-" * 90)
-
-    rewards = []
+    totals = []
     for i, ex in enumerate(examples):
         gt = ex["cql_query"]
-        # Test 1: reward for the ground truth itself (should be high)
-        r = compute_reward(gt, gt)
-        rewards.append(r["reward"])
-        print(f"{i+1:3d}  {r['reward']:7.3f}  {str(r['is_valid']):>5}  {r['bigram_sim']:5.3f}  {gt[:60].replace(chr(10), ' | ')}")
+        r = compute_combined_reward(gt, gt, weights)
+        totals.append(r["reward"])
+        print(f"{i+1:3d}  {r['reward']:6.3f}  {r['format']:5.2f}  {r['ngram']:5.2f}  {gt[:60].replace(chr(10), ' | ')}")
+    print(f"Mean: {sum(totals)/len(totals):.3f}  (format=0.0 expected since no think tags)\n")
 
+    # --- Test 2: ground truth WITH think tags ---
+    print("=== Same queries wrapped in <think>...</think> ===")
+    print(f"{'#':>3}  {'Total':>6}  {'Fmt':>5}  {'Ngram':>5}  Think?")
     print("-" * 90)
-    print(f"Mean reward (ground truth vs itself): {sum(rewards)/len(rewards):.3f}")
-    print()
+    totals2 = []
+    for i, ex in enumerate(examples[:5]):
+        gt = ex["cql_query"]
+        wrapped = f"<think>\nI need to write a query for {ex.get('nl_query', 'this task')[:40]}...\n</think>\n{gt}"
+        r = compute_combined_reward(wrapped, gt, weights)
+        totals2.append(r["reward"])
+        print(f"{i+1:3d}  {r['reward']:6.3f}  {r['format']:5.2f}  {r['ngram']:5.2f}  {r['has_thinking']}")
+    print(f"Mean: {sum(totals2)/len(totals2):.3f}  (format=1.0 expected with proper tags)\n")
 
-    # Test with deliberately broken queries
-    print("=== Broken query tests ===")
+    # --- Test 3: broken / edge cases ---
+    gt0 = examples[0]["cql_query"]
     broken = [
-        ("Empty string", "", examples[0]["cql_query"]),
-        ("Just text", "show me all events", examples[0]["cql_query"]),
-        ("Unclosed paren", "search(foo", examples[0]["cql_query"]),
-        ("Unclosed string", 'where name="hello', examples[0]["cql_query"]),
-        ("Almost correct", examples[0]["cql_query"].replace("|", "||"), examples[0]["cql_query"]),
+        ("Empty string", ""),
+        ("Just text (no CQL)", "show me all events"),
+        ("Think but no CQL after", "<think>I'm thinking...</think>"),
+        ("Think + wrong CQL", f"<think>reasoning</think>\nSELECT * FROM events"),
+        ("Partial think (no close)", f"<think>reasoning\n{gt0}"),
+        ("Perfect with think", f"<think>Let me write this query</think>\n{gt0}"),
+        ("Perfect without think", gt0),
     ]
-    print(f"\n{'Test':<25}  {'Reward':>7}  {'Valid':>5}  {'BiSim':>5}  Errors")
-    print("-" * 90)
-    for name, query, gt in broken:
-        r = compute_reward(query, gt)
-        errs = "; ".join(r["errors"][:2]) if r["errors"] else "-"
-        print(f"{name:<25}  {r['reward']:7.3f}  {str(r['is_valid']):>5}  {r['bigram_sim']:5.3f}  {errs[:40]}")
+    print("=== Edge cases ===")
+    print(f"{'Test':<28}  {'Total':>6}  {'Fmt':>5}  {'Ngram':>5}  {'Think':>5}  Extracted CQL (first 50)")
+    print("-" * 110)
+    for name, query in broken:
+        r = compute_combined_reward(query, gt0, weights)
+        cql_preview = r["extracted_cql"][:50].replace("\n", " ")
+        print(f"{name:<28}  {r['reward']:6.3f}  {r['format']:5.2f}  {r['ngram']:5.2f}  {str(r['has_thinking']):>5}  {cql_preview}")
 
-    # Invariant check
-    print("\n=== Invariant check: invalid must always score < valid ===")
-    valid_r = compute_reward(examples[0]["cql_query"], examples[0]["cql_query"])
-    invalid_r = compute_reward("search(foo", examples[0]["cql_query"])
-    ok = invalid_r["reward"] < valid_r["reward"]
-    print(f"  Valid reward:   {valid_r['reward']}")
-    print(f"  Invalid reward: {invalid_r['reward']}")
-    print(f"  Invariant holds: {'✓ YES' if ok else '✗ NO — BUG!'}")
+    # --- Test 4: format reward incentive check ---
+    print("\n=== Incentive check: does <think> get higher reward? ===")
+    r_bare = compute_combined_reward(gt0, gt0, weights)
+    r_think = compute_combined_reward(f"<think>reasoning</think>\n{gt0}", gt0, weights)
+    print(f"  Bare CQL:         reward={r_bare['reward']:.3f} (format={r_bare['format']:.1f}, ngram={r_bare['ngram']:.2f})")
+    print(f"  With <think> tags: reward={r_think['reward']:.3f} (format={r_think['format']:.1f}, ngram={r_think['ngram']:.2f})")
+    delta = r_think["reward"] - r_bare["reward"]
+    print(f"  Delta: +{delta:.3f} {'✓ think tags rewarded' if delta > 0 else '✗ NO INCENTIVE — check weights!'}")
 
 
 if __name__ == "__main__":
