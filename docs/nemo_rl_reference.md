@@ -514,11 +514,11 @@ mlflow ui --host 0.0.0.0 --port=5000
 
 ### Our Dummy Pipeline Logger
 
-Our `cql_nemo_rl_config.yaml` already has logger config. When transitioning to real
+Our `cql_nemo_rl_nemotron30b.yaml` already has logger config. When transitioning to real
 NeMo RL, just enable the backends you want:
 
 ```yaml
-# In configs/cql_nemo_rl_config.yaml, add:
+# In configs/cql_nemo_rl_nemotron30b.yaml, add:
 logger:
   tensorboard_enabled: true
   wandb_enabled: true

@@ -103,16 +103,17 @@ Each line is JSON:
 ## Step 5 — Run unit tests
 
 ```bash
-python -m pytest utils/test_cql_validator.py utils/test_cql_tokenizer.py -v
+python -m pytest utils/ -v
 ```
 
-Expected: **45 passed**. These test:
+Expected: **69 passed**. These test:
 - CQL syntax validator (balanced parens, valid pipes, known functions, unclosed strings)
 - CQL tokenizer (semantic tokenization, bigram similarity, structural similarity)
+- Reward functions (format, ngram, combined, invariants)
 
-To run a specific test:
+To run a specific test file:
 ```bash
-python -m pytest utils/test_cql_validator.py::test_valid_simple_query -v
+python -m pytest utils/test_reward_invariant.py -v
 ```
 
 ---
@@ -199,26 +200,15 @@ If you see `Missing: <key>`, the YAML is malformed.
 
 ---
 
-## Step 8 — Test the reward server (optional)
+## Step 8 — Explore rewards interactively (optional)
 
-The FastAPI reward server is an alternative reward interface (the default for GRPO is the Ray environment, not this server). Useful for debugging:
+The reward playground lets you experiment with different inputs and see how rewards are computed:
 
 ```bash
-# Start the server
-python resources/cql_resource_server.py &
-
-# Test it
-curl -X POST http://localhost:8000/verify \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Write CQL to find failed logins",
-    "response": "#event_simpleName=UserLogon | where LogonType=\"10\" | where status!=\"Success\" | stats count() by UserName",
-    "metadata": {"golden_query": "#event_simpleName=UserLogon | where status!=\"Success\""}
-  }'
-
-# Stop the server
-kill %1
+python notebooks/reward_playground.py
 ```
+
+Runs 5 demos (same query scored 5 ways, tokenizer internals, ngram math, weight sweep, GRPO simulation) then drops into a REPL where you can call `score()`, `compare()`, `sweep_weights()`, etc.
 
 ---
 
@@ -226,12 +216,12 @@ kill %1
 
 | Task | Command | Works on Mac? |
 |------|---------|:---:|
-| Run unit tests | `python -m pytest utils/test_*.py -v` | ✅ |
+| Run unit tests | `python -m pytest utils/ -v` | ✅ |
 | Test reward logic | `python scripts/test_rewards_local.py` | ✅ |
 | Dry-run all configs | `python scripts/run_grpo_cql.py --dry-run` | ✅ |
 | Fetch/inspect data | `python scripts/fetch_data.py` | ✅ |
-| Test reward server | `python resources/cql_resource_server.py` | ✅ |
-| Edit rewards, re-test | Edit `cql_environment.py`, run tests | ✅ |
+| Reward playground | `python notebooks/reward_playground.py` | ✅ |
+| Edit rewards, re-test | Edit `cql_rewards.py`, run tests | ✅ |
 | Edit configs, dry-run | Edit YAML, `--dry-run` | ✅ |
 
 ## What you CANNOT do locally
@@ -273,7 +263,7 @@ python scripts/test_rewards_local.py
 python scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.5,"execution":0.2}'
 
 # 5. Run unit tests to make sure nothing broke
-python -m pytest utils/test_cql_validator.py utils/test_cql_tokenizer.py -v
+python -m pytest utils/ -v
 
 # 6. Tweak config / reward weights
 vim configs/cql_nemo_rl_nemotron30b.yaml
@@ -304,10 +294,11 @@ pip install -r requirements.txt
 **`python: command not found`**  
 → Use `python3` instead of `python`, or activate the venv (which aliases `python` → `python3`)
 
-**Tests fail with `No module named 'fastapi'`**  
-→ Only `test_reward_invariant.py` needs FastAPI. Run the core tests instead:
+**Tests fail with `ModuleNotFoundError`**  
+→ Make sure you installed requirements:
 ```bash
-python -m pytest utils/test_cql_validator.py utils/test_cql_tokenizer.py -v
+pip install -r requirements.txt
+python -m pytest utils/ -v
 ```
 
 **`fetch_data.py` fails cloning**  

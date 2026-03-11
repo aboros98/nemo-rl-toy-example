@@ -51,8 +51,8 @@ OVERRIDES="++grpo.max_num_steps=100" sbatch scripts/slurm/grpo.sh
 # Change learning rate:
 OVERRIDES="++optimizer.lr=1e-5" sbatch scripts/slurm/grpo.sh
 
-# Use different config (e.g., small model for testing):
-CONFIG=configs/cql_nemo_rl_config.yaml sbatch scripts/slurm/grpo.sh
+# Use full fine-tuning config:
+CONFIG=configs/cql_nemo_rl_nemotron30b_full.yaml sbatch scripts/slurm/grpo.sh
 
 # Multiple overrides (Hydra-style):
 OVERRIDES="++grpo.num_generations_per_prompt=16 ++loss_fn.reference_policy_kl_penalty=0.001" sbatch scripts/slurm/grpo.sh

@@ -34,7 +34,7 @@ how to build a Gym environment from scratch, and how our dummy pipeline maps to 
 └──────────────┘                               └──────────────┘
      ▲                                               ▲
      │                                               │
- cql_nemo_rl_config.yaml                    cql_resource_server.py
+ cql_nemo_rl_nemotron30b.yaml                cql_environment.py
 ```
 
 **NeMo RL** = the training framework. It does what TRL does: loads the model, generates completions,
@@ -78,7 +78,7 @@ class BaseVerifyResponse(BaseVerifyRequest):
 
 ## Training Parameters Deep-Dive
 
-These are the knobs that matter for GRPO training. All configurable in `cql_nemo_rl_config.yaml`.
+These are the knobs that matter for GRPO training. All configurable in `cql_nemo_rl_nemotron30b.yaml`.
 
 ### Gradient Clipping
 
@@ -483,7 +483,7 @@ class CQLVerifier(SimpleResourcesServer):
 ```
 
 The `compute_reward()` function is **exactly our existing code** from
-`cql_resource_server.py` — modular weighted sum of syntax, execution, ngram.
+`cql_rewards.py` — modular weighted sum of format, ngram, execution.
 
 ### Step 3: Configure the environment
 
@@ -560,16 +560,16 @@ class CQLServer(SimpleResourcesServer):
 
 ```bash
 # Instead of: python scripts/train_grpo.py
-uv run examples/run_grpo.py --config configs/cql_nemo_rl_config.yaml
+uv run python scripts/run_grpo_cql.py --config configs/cql_nemo_rl_nemotron30b.yaml
 ```
 
-Our `cql_nemo_rl_config.yaml` is verified against the real `grpo_math_1B.yaml`.
+Our `cql_nemo_rl_nemotron30b.yaml` is verified against the real NVIDIA recipe.
 
 ---
 
 ## NeMo RL Config Explained
 
-Section-by-section reference for `cql_nemo_rl_config.yaml`.
+Section-by-section reference for `cql_nemo_rl_nemotron30b.yaml`.
 
 ### `grpo:` — Algorithm parameters
 

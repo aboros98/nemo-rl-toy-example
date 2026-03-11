@@ -3,7 +3,7 @@
 
 Usage:
     uv run python scripts/run_grpo_cql.py --config configs/cql_nemo_rl_nemotron30b.yaml
-    uv run python scripts/run_grpo_cql.py --config configs/cql_nemo_rl_config.yaml ++grpo.max_num_steps=50
+    uv run python scripts/run_grpo_cql.py --config configs/cql_nemo_rl_nemotron30b.yaml ++grpo.max_num_steps=50
     python scripts/run_grpo_cql.py --dry-run  # validate config without NeMo RL
 """
 

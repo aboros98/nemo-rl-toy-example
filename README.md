@@ -20,8 +20,8 @@ pip install -r requirements.txt
 # Fetch training data (3 public sources → 442 train / 55 val / 56 test)
 python3 scripts/fetch_data.py
 
-# Run unit tests (45 tests — validator + tokenizer)
-python3 -m pytest utils/test_cql_validator.py utils/test_cql_tokenizer.py -v
+# Run unit tests (69 tests — validator + tokenizer + rewards)
+python3 -m pytest utils/ -v
 
 # Test reward logic locally — no NeMo RL needed
 python3 scripts/test_rewards_local.py
@@ -250,7 +250,7 @@ When you have a Docker container that can compile CQL queries:
 | `cql_nemo_rl_nemotron30b_full.yaml` | GRPO | Full FT | Higher ceiling, more memory |
 | `sft_cql_config.yaml` | SFT | LoRA | SFT warmup before GRPO |
 | `sft_cql_full_config.yaml` | SFT | Full FT | SFT warmup, full params |
-| `cql_nemo_rl_config.yaml` | GRPO | LoRA | Dummy validation (small model) |
+
 
 All configs are verified against the [official NVIDIA recipe](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml). Key Mamba2 constraints enforced:
 - `lora_cfg.exclude_modules: ['*out_proj*']` — mandatory (SSM has zero gradient)
@@ -290,8 +290,7 @@ cql_rlvr/
 │   ├── cql_nemo_rl_nemotron30b.yaml       # GRPO LoRA (production)
 │   ├── cql_nemo_rl_nemotron30b_full.yaml  # GRPO full FT
 │   ├── sft_cql_config.yaml                # SFT LoRA
-│   ├── sft_cql_full_config.yaml           # SFT full FT
-│   └── cql_nemo_rl_config.yaml            # Dummy validation
+│   └── sft_cql_full_config.yaml           # SFT full FT
 ├── utils/
 │   ├── cql_rewards.py          # Reward functions (format + ngram + execution)
 │   ├── cql_validator.py         # CQL syntax validator
@@ -299,7 +298,6 @@ cql_rlvr/
 │   ├── cql_data_processor.py    # NeMo RL data processor (system/user/assistant)
 │   └── test_*.py                # Unit tests
 ├── resources/
-│   ├── cql_resource_server.py   # FastAPI reward server (alternative to environment)
 │   └── cql_system_prompt.txt    # Few-shot system prompt
 ├── data/                        # train.jsonl, val.jsonl, test.jsonl
 ├── logs/                        # TensorBoard logs

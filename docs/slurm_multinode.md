@@ -82,7 +82,7 @@ sbatch scripts/slurm/grpo.sh
 ```bash
 OVERRIDES="++grpo.max_num_steps=100" sbatch scripts/slurm/grpo.sh
 OVERRIDES="++grpo.num_generations_per_prompt=16" sbatch scripts/slurm/grpo.sh
-CONFIG=configs/cql_nemo_rl_config.yaml sbatch scripts/slurm/grpo.sh
+CONFIG=configs/cql_nemo_rl_nemotron30b_full.yaml sbatch scripts/slurm/grpo.sh
 ```
 
 ### 4. Monitor
@@ -151,7 +151,7 @@ NeMo RL has a built-in SLURM launcher. See the [cluster docs](https://docs.nvidi
 The only things that change between single-GPU and multi-node:
 
 ```yaml
-# configs/cql_nemo_rl_config.yaml
+# configs/cql_nemo_rl_nemotron30b.yaml
 
 cluster:
   gpus_per_node: 8         # GPUs per machine (RunPod: 1, A100 node: 8)
@@ -187,18 +187,10 @@ Everything else stays the same.
 
 ---
 
-## Reward Server Scaling
+## Reward Environment Scaling
 
-For large clusters (>16 GPUs), the reward server may bottleneck. Options:
-
-1. **Multiple Uvicorn workers** (easiest):
-   ```bash
-   uvicorn resources.cql_resource_server:create_app \
-       --factory --host 0.0.0.0 --port 8080 --workers 8
-   ```
-
-2. **NeMo Gym native scaling** — when using NeMo Gym SDK, it replicates the environment
-   automatically via the `num_workers` config.
+For large clusters (>16 GPUs), NeMo RL Ray environment actors scale automatically.
+Each actor runs in-process — no separate server needed.
 
 ---
 
@@ -212,7 +204,7 @@ For large clusters (>16 GPUs), the reward server may bottleneck. Options:
 | Permission denied on logs/ | `mkdir -p logs/` before submitting |
 | NCCL timeout between nodes | Check: `ibstat` for InfiniBand, or set `NCCL_IB_DISABLE=1` for TCP fallback |
 | OOM during generation | Lower `generation_batch_size`; enable `activation_checkpointing: true` |
-| Reward server unreachable | Check the hostname file exists; verify port 8080 is open between nodes |
+| Reward env failures | Check Ray logs; verify `utils/` is importable via PYTHONPATH |
 | Job killed by time limit | Increase `--time` or add checkpointing so you can resume |
 
 ---
