@@ -26,6 +26,7 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 OVERRIDES=${OVERRIDES:-""}
 
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+export PYTHONPATH=/workspace/cql_rlvr:${PYTHONPATH:-}
 
 LOG_DIR="logs/${SLURM_JOB_ID}"
 mkdir -p "$LOG_DIR"

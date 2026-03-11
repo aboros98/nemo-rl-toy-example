@@ -22,17 +22,21 @@ class ValidationResult:
 
 
 # Comprehensive whitelist of known CQL (LogScale) functions
+# Includes KQL functions used in training data (NL2KQL transfer dataset)
 KNOWN_FUNCTIONS: set[str] = {
     # Aggregation functions
     "avg", "count", "counterRate", "max", "min", "percentile",
     "range", "rate", "rdns", "stddev", "sum", "variance",
+    "dcount", "dcountif", "countif", "sumif", "avgif",
+    "arg_max", "arg_min", "make_set", "make_list", "make_bag",
+    "any", "take_any", "hll", "hll_merge", "tdigest", "tdigest_merge",
     # Transformation functions
     "bucket", "case", "cidr", "collect", "concat", "concatArray",
     "convert", "copyEvent", "crypto", "default", "drop", "dropEvent",
     "eval", "eventFieldCount", "eventSize", "extract",
     "fieldset", "findTimestamp", "format", "formatDuration",
     "formatTime", "geohash", "groupBy", "hash", "head",
-    "if", "in", "ipLocation", "join", "kvParse", "length",
+    "if", "iff", "in", "ipLocation", "join", "kvParse", "length",
     "lookup", "lower", "lowercase", "match", "math",
     "now", "parseCEF", "parseCsv", "parseFixedWidth",
     "parseHexString", "parseJson", "parseLEEF", "parseTimestamp",
@@ -52,19 +56,55 @@ KNOWN_FUNCTIONS: set[str] = {
     # String functions
     "contains", "startsWith", "endsWith", "indexOf",
     "lastIndexOf", "leftPad", "rightPad",
+    "strcat", "strcat_delim", "strlen", "strrep",
+    "toupper", "tolower", "tostring", "tolong", "toint", "todouble",
+    "tobool", "todecimal", "todatetime", "totimespan", "todynamic",
+    "parse_json", "parse_url", "parse_urlquery", "parse_path",
+    "extract_all", "extract_json",
+    "has_any", "has_all", "has_cs",
+    "isempty", "isnotempty", "isnull", "isnotnull", "isnan", "isinf",
     # Array functions
     "array", "arrayLength", "flatten",
+    "array_length", "array_sort_asc", "array_sort_desc",
+    "pack_array", "pack_all",
     # Math functions
     "abs", "ceil", "floor", "log", "log2", "log10",
-    "pow", "sqrt", "mod",
-    # Date functions
+    "pow", "sqrt", "mod", "bin", "ceiling",
+    # Date/Time functions
     "formatDate", "parseDate", "dateDiff",
+    "ago", "datetime", "now", "datetime_add", "datetime_diff",
+    "startofday", "startofweek", "startofmonth", "startofyear",
+    "endofday", "endofweek", "endofmonth", "endofyear",
+    "between", "format_datetime", "format_timespan",
+    "make_datetime", "make_timespan", "getmonth", "getyear",
+    "dayofweek", "dayofmonth", "dayofyear", "hourofday", "monthofyear",
     # Network functions
     "asn", "communityId",
+    "ipv4_is_private", "ipv4_is_match", "ipv4_compare",
     # Visualization
-    "sankey", "worldmap",
+    "sankey", "worldmap", "render",
+    # Table operations (KQL)
+    "project", "extend", "summarize", "distinct", "limit", "take",
+    "order", "union", "print", "datatable", "externaldata",
+    "mv_expand", "mv_apply", "invoke",
+    "selectLast", "selectFromMax", "selectFromMin",
+    "defineTable", "readFile", "enrich",
+    # Conditional / logical
+    "coalesce", "max_of", "min_of",
+    "dynamic", "pack", "bag_keys",
+    "AND", "OR", "NOT",
+    "and", "or", "not",
+    "inner", "outer", "leftouter", "rightouter", "fullouter", "leftsemi",
     # CrowdStrike-specific
-    "aid", "cid", "aidMasterSwitch",
+    "aid", "cid", "aidMasterSwitch", "aid_master",
+    # Additional KQL/CQL functions from training data
+    "bag_unpack", "bag_merge", "bag_remove_keys",
+    "formattime", "base64Decode", "base64Encode",
+    "typeof", "gettype", "argmax", "argmin",
+    "series_decompose", "series_stats", "series_fill_linear",
+    "extractFlags", "duration",
+    "set_union", "set_difference", "set_intersect",
+    "split", "groupby", "iF", "parseTimeStamp",
 }
 
 

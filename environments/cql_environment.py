@@ -67,6 +67,7 @@ class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards,
             terminateds=done,
+            answers=None,
         )
 
     def global_post_process_and_metrics(

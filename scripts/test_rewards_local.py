@@ -19,20 +19,20 @@ from utils.cql_tokenizer import bigram_similarity
 
 
 def compute_reward(response: str, ground_truth: str) -> dict:
-    """Same logic the CQL environment uses — extend this to test new rewards."""
+    """Same binary logic the CQL environment uses during GRPO training.
+
+    Matches environments/cql_environment.py: valid=1.0, invalid=0.0.
+    Edit this to prototype new reward formulas before deploying.
+    """
     result = validate(response)
     sim = bigram_similarity(response, ground_truth)
 
-    if not result.is_valid:
-        reward = max(-0.5 + 0.1 * sim, -1.0)
-        category = "INVALID"
-    else:
-        reward = 0.4 + 0.6 * sim
-        category = "VALID"
+    # Binary reward — matches actual environment
+    reward = 1.0 if result.is_valid else 0.0
 
     return {
         "reward": round(reward, 3),
-        "category": category,
+        "category": "VALID" if result.is_valid else "INVALID",
         "is_valid": result.is_valid,
         "errors": result.errors,
         "bigram_sim": round(sim, 3),
