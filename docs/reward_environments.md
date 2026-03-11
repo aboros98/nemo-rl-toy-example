@@ -1,10 +1,27 @@
-# Creating Custom Reward Environments — NeMo RL
+# Creating Custom Reward Environments
 
 How to build, register, and use your own reward environments for GRPO training.
 
 ---
 
-## Architecture
+## Two Approaches
+
+There are **two different ways** to create reward environments in the NVIDIA stack:
+
+| | NeMo RL Environment | NeMo Gym Resource Server |
+|---|---|---|
+| **Repo** | [NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) | [NVIDIA-NeMo/Gym](https://github.com/NVIDIA-NeMo/Gym) |
+| **Pattern** | Ray actor implementing `EnvironmentInterface` | FastAPI server subclassing `SimpleResourcesServer` |
+| **Method** | `step(message_log_batch, metadata)` → `EnvironmentReturn` | `async verify(body: BaseVerifyRequest)` → `BaseVerifyResponse` |
+| **Communication** | In-process (Ray) | HTTP (`/verify` endpoint) |
+| **Best for** | Pure-Python rewards, fast scoring | External services, LLM judges, sandboxed execution |
+| **We use** | ✅ This one (`environments/cql_environment.py`) | Not yet (planned for LogScale Docker) |
+
+**NeMo RL has a built-in bridge**: the `nemo_gym` environment type in NeMo RL wraps any NeMo Gym resource server as a standard `EnvironmentInterface`, so you can use either approach with NeMo RL training.
+
+---
+
+## Approach 1: NeMo RL Environment (Ray Actor) — What We Use
 
 ```
 GRPO loop:
@@ -114,12 +131,19 @@ from nemo_rl.environments.utils import register_env
 register_env("my_reward", "environments.my_reward.MyRewardEnv")
 ```
 
-In your YAML config:
+In your YAML config, two things connect:
 
 ```yaml
+# 1. Environment config — passed as cfg dict to __init__
 env:
   my_reward:         # must match the name in register_env()
     num_workers: 8   # Ray actors for parallel reward eval
+
+# 2. Data config — tells NeMo RL which env to use for this dataset
+data:
+  default:
+    env_name: "my_reward"   # must match the key under env:
+    processor: "my_data_processor"
 ```
 
 That's it. NeMo RL handles actor creation, batching, and lifecycle.
@@ -207,18 +231,19 @@ def compute_reward(self, response, ground_truth):
 ```
 Good for: open-ended tasks, style, helpfulness. Slow — use sparingly.
 
-### Pattern 4: Multi-component with hard constraints
+### Pattern 4: Multi-component with structural matching
 ```python
 def compute_reward(self, response, ground_truth):
     # Hard constraint: invalid syntax → capped at 0.0
     if not is_valid_syntax(response):
-        return max(-0.5 + 0.1 * ngram_sim(response, ground_truth), -1.0)
+        return 0.0
 
     # Soft rewards for valid syntax
-    base = 0.3
-    base += 0.3 * passes_execution(response)
-    base += 0.4 * ngram_sim(response, ground_truth)
-    return base
+    score = 0.0
+    score += 0.3 * structural_similarity(response, ground_truth)  # right operations
+    score += 0.6 * field_f1(response, ground_truth)               # right data
+    score += 0.1 * format_compliance(response)                    # reasoning tags
+    return min(score, 1.0)
 ```
 Good for: CQL, SQL, any domain with verifiable constraints. The key invariant: **invalid must always score lower than valid**.
 
@@ -339,6 +364,110 @@ View in TensorBoard:
 ```bash
 tensorboard --logdir logs/ --port 6006
 ```
+
+---
+
+## Approach 2: NeMo Gym Resource Server (FastAPI)
+
+NeMo Gym (https://github.com/NVIDIA-NeMo/Gym) uses a different pattern: FastAPI HTTP servers that expose a `/verify` endpoint. NeMo RL can call these via the built-in `nemo_gym` environment adapter.
+
+### Minimal Template
+
+```python
+"""resources_servers/my_reward/app.py"""
+
+from nemo_gym.base_resources_server import (
+    BaseResourcesServerConfig,
+    BaseVerifyRequest,
+    BaseVerifyResponse,
+    SimpleResourcesServer,
+)
+
+
+class MyResourcesServerConfig(BaseResourcesServerConfig):
+    name: str = "my_reward"
+
+
+class MyResourcesServer(SimpleResourcesServer):
+    config: MyResourcesServerConfig
+
+    async def verify(self, body: BaseVerifyRequest) -> BaseVerifyResponse:
+        # body.response contains the model's full response (NeMoGymResponse object)
+        # body.responses_create_params has the original prompt
+        model_output = body.response.output_text or ""
+
+        # ---- YOUR REWARD LOGIC HERE ----
+        reward = 1.0 if "correct answer" in model_output else 0.0
+
+        return BaseVerifyResponse(**body.model_dump(), reward=reward)
+
+
+if __name__ == "__main__":
+    MyResourcesServer.run_webserver()
+```
+
+### Key Differences from NeMo RL Environments
+
+| NeMo RL `step()` | NeMo Gym `verify()` |
+|---|---|
+| Receives `list[LLMMessageLogType]` (batch) | Receives single `BaseVerifyRequest` |
+| Returns `EnvironmentReturn` (NamedTuple) | Returns `BaseVerifyResponse` with `reward: float` |
+| Ray actor, in-process | HTTP server, can run anywhere |
+| You handle batching | NeMo Gym handles batching/concurrency |
+
+### Extending with Custom Fields
+
+Add task-specific fields to the request/response (like the text_to_sql example in NeMo Gym):
+
+```python
+from pydantic import BaseModel
+
+class CQLVerifyRequest(BaseVerifyRequest):
+    cql: str              # ground truth CQL
+    nl_query: str         # natural language question
+    schema_context: str   # event type schema
+
+class CQLVerifyResponse(BaseVerifyResponse):
+    extracted_cql: str | None = None
+    structure_score: float = 0.0
+    fields_score: float = 0.0
+```
+
+### Using NeMo Gym Servers with NeMo RL
+
+NeMo RL has a built-in `nemo_gym` environment that wraps any NeMo Gym resource server:
+
+```yaml
+env:
+  nemo_gym:
+    model_name: ${policy.model_name}
+    base_urls: ["http://localhost:8080"]
+    initial_global_config_dict:
+      # NeMo Gym config goes here
+```
+
+This lets you write reward logic as an HTTP server (NeMo Gym pattern) but use it with NeMo RL's GRPO training. The `NemoGym` adapter in NeMo RL handles generation, token-level logprobs, and the training loop — your server just scores.
+
+### Real Example: text_to_sql (from NeMo Gym repo)
+
+See `resources_servers/text_to_sql/` in [NVIDIA-NeMo/Gym](https://github.com/NVIDIA-NeMo/Gym):
+- Extracts SQL from model response (code blocks or raw)
+- Uses LLM-as-judge for semantic equivalence checking
+- Supports swap-check to detect positional bias
+- Binary reward: 1.0 if equivalent, 0.0 otherwise
+
+### When to Use Which
+
+**Use NeMo RL environments (Approach 1) when:**
+- Reward is pure Python (fast, no external calls)
+- You want simple single-file setup
+- You're doing GRPO training with NeMo RL
+
+**Use NeMo Gym resource servers (Approach 2) when:**
+- Reward needs external services (Docker sandbox, LLM judge, database)
+- You want to test rewards independently via HTTP
+- You're using NeMo Gym's rollout collection pipeline
+- You need multi-step agent evaluation
 
 ---
 
