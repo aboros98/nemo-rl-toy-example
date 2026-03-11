@@ -243,11 +243,7 @@ data:
 # ============================================================================
 env:
   cql:
-    num_workers: 8                   # Match GPU count
-    reward_server_url: "http://localhost:8080"
-    reward_endpoint: "/compute_rewards"
-    verify_endpoint: "/verify"
-    health_endpoint: "/health"
+    num_workers: 8
 
 # ============================================================================
 # Logger — TensorBoard + W&B for production monitoring

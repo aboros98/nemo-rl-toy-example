@@ -210,10 +210,6 @@ data:
 env:
   cql:
     num_workers: 8
-    reward_server_url: "http://localhost:8080"
-    reward_endpoint: "/compute_rewards"
-    verify_endpoint: "/verify"
-    health_endpoint: "/health"
 
 # ============================================================================
 # Logger

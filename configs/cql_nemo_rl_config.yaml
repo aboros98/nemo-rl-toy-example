@@ -223,10 +223,6 @@ data:
 env:
   cql:
     num_workers: 1
-    reward_server_url: "http://localhost:8080"
-    reward_endpoint: "/compute_rewards"
-    verify_endpoint: "/verify"
-    health_endpoint: "/health"
 
 # ============================================================================
 # Logger — TensorBoard enabled for dummy validation
