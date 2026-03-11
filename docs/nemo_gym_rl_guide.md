@@ -483,7 +483,7 @@ class CQLVerifier(SimpleResourcesServer):
 ```
 
 The `compute_reward()` function is **exactly our existing code** from
-`cql_rewards.py` — modular weighted sum of format, ngram, execution.
+`cql_rewards.py` — modular weighted sum of format, structure, fields, execution.
 
 ### Step 3: Configure the environment
 
@@ -553,7 +553,7 @@ class CQLServer(SimpleResourcesServer):
         golden_cql = body.responses_create_params.metadata.get("golden_cql", "")
 ```
 
-`compute_reward()`, `reward_syntax()`, `reward_execution()`, `reward_ngram()` stay
+`compute_reward()`, `reward_structure()`, `reward_execution()`, `reward_fields()` stay
 **exactly the same**.
 
 ### Launch with real NeMo RL

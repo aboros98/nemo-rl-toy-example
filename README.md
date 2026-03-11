@@ -159,15 +159,21 @@ During GRPO, for each prompt NeMo RL generates N rollouts (default: 8), then ask
 Prompt → vLLM generates 8 responses → CQLEnvironment.step() scores each → GRPO computes advantages
 ```
 
-### Three reward components (R1-style)
+### Four reward components (R1-style)
 
 | Component | Weight | What it measures | Range |
 |-----------|--------|-----------------|-------|
-| **N-gram similarity** | 0.8 | Bigram F1 between generated CQL and reference | 0.0 – 1.0 |
-| **Format (think tags)** | 0.2 | Does the model use `<think>...</think>` reasoning? | 0.0 / 0.5 / 1.0 |
+| **Structure** | 0.3 | Jaccard of pipeline function names (right operations) | 0.0 – 1.0 |
+| **Fields** | 0.6 | F1 of tags, field names, string literals (right data) | 0.0 – 1.0 |
+| **Format (think tags)** | 0.1 | Does the model use `<think>...</think>` reasoning? | 0.0 / 0.5 / 1.0 |
 | **Execution** | 0.0 | Placeholder — Docker LogScale compilation check | 0.0 always |
 
-**Combined reward** = `0.8 × ngram + 0.2 × format + 0.0 × execution` (configurable in YAML)
+**Combined reward** = `0.3 × structure + 0.6 × fields + 0.1 × format + 0.0 × execution` (configurable in YAML)
+
+**Why structure + fields instead of ngram similarity?**
+- **Structure** (Jaccard of function names) rewards getting the right operations (`where`, `groupBy`, `stats`) regardless of exact syntax
+- **Fields** (F1 of entities) rewards referencing the right event types, field names, and values — the semantic content
+- Together they're more robust than ngram: semantically equivalent queries with different phrasing score equally
 
 **Format reward scoring:**
 - `0.0` — no `<think>` or `</think>` tags
@@ -175,22 +181,24 @@ Prompt → vLLM generates 8 responses → CQLEnvironment.step() scores each → 
 - `1.0` — has both `<think>` and `</think>`
 
 **Example rewards:**
-| Response | Format | N-gram | Total |
-|----------|--------|--------|-------|
-| `<think>reasoning</think>\n<perfect CQL>` | 1.0 | 1.0 | **1.0** |
-| `<perfect CQL>` (no think tags) | 0.0 | 1.0 | **0.8** |
-| `<think>reasoning</think>\n<wrong CQL>` | 1.0 | 0.2 | **0.36** |
-| `<think>only thinking, no CQL` | 0.5 | 0.0 | **0.10** |
-| empty response | 0.0 | 0.0 | **0.0** |
+| Response | Fmt | Struc | Fields | Total |
+|----------|-----|-------|--------|-------|
+| `<think>reasoning</think>\n<perfect CQL>` | 1.0 | 1.0 | 1.0 | **1.0** |
+| `<perfect CQL>` (no think tags) | 0.0 | 1.0 | 1.0 | **0.9** |
+| `<think>...</think>\n<right ops, wrong fields>` | 1.0 | 1.0 | 0.3 | **0.58** |
+| `<think>...</think>\n<wrong ops, right fields>` | 1.0 | 0.0 | 1.0 | **0.70** |
+| `<think>only thinking, no CQL` | 0.5 | 0.0 | 0.0 | **0.05** |
+| empty response | 0.0 | 0.0 | 0.0 | **0.0** |
 
 ### Architecture
 
 ```
 utils/cql_rewards.py              ← Pure Python reward logic (no GPU deps)
   ├── compute_format_reward()     ← Think tag scoring
-  ├── compute_ngram_reward()      ← Bigram similarity
+  ├── compute_structure_reward()  ← Pipeline function Jaccard
+  ├── compute_field_reward()      ← Entity set F1
   ├── compute_execution_reward()  ← Placeholder for Docker LogScale
-  └── compute_combined_reward()   ← Weighted sum of all three
+  └── compute_combined_reward()   ← Weighted sum of all four
 
 environments/cql_environment.py   ← NeMo RL wrapper (imports from cql_rewards.py)
 scripts/test_rewards_local.py     ← Local testing (imports from cql_rewards.py)
@@ -206,14 +214,15 @@ env:
   cql:
     num_workers: 8
     reward_weights:
-      format: 0.2      # think tag compliance
-      ngram: 0.8        # bigram similarity to reference
+      format: 0.1      # think tag compliance
+      structure: 0.3    # pipeline function Jaccard
+      fields: 0.6       # entity set F1
       execution: 0.0    # set >0 when Docker LogScale is ready
 ```
 
 Or override from CLI:
 ```bash
-OVERRIDES="++env.cql.reward_weights.format=0.3 ++env.cql.reward_weights.ngram=0.7" sbatch scripts/slurm/grpo.sh
+OVERRIDES="++env.cql.reward_weights.structure=0.4 ++env.cql.reward_weights.fields=0.5" sbatch scripts/slurm/grpo.sh
 ```
 
 ### Testing rewards locally (Mac, no GPU)
@@ -223,7 +232,7 @@ OVERRIDES="++env.cql.reward_weights.format=0.3 ++env.cql.reward_weights.ngram=0.
 python3 scripts/test_rewards_local.py
 
 # Custom weights
-python3 scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.7,"execution":0.0}'
+python3 scripts/test_rewards_local.py --weights '{"format":0.1,"structure":0.4,"fields":0.5,"execution":0.0}'
 
 # More examples
 python3 scripts/test_rewards_local.py --n 50 --data data/val.jsonl
@@ -236,8 +245,8 @@ python3 scripts/test_rewards_local.py --n 50 --data data/val.jsonl
 When you have a Docker container that can compile CQL queries:
 
 1. Edit `compute_execution_reward()` in `utils/cql_rewards.py` — add HTTP call to Docker
-2. Test locally: `python3 scripts/test_rewards_local.py --weights '{"format":0.1,"ngram":0.3,"execution":0.6}'`
-3. Update config: set `execution: 0.6` (or whatever weight you choose)
+2. Test locally: `python3 scripts/test_rewards_local.py --weights '{"format":0.1,"structure":0.2,"fields":0.3,"execution":0.4}'`
+3. Update config: set `execution: 0.4` (rebalance other weights to sum to 1.0)
 4. Push and retrain
 
 ---
@@ -292,7 +301,7 @@ cql_rlvr/
 │   ├── sft_cql_config.yaml                # SFT LoRA
 │   └── sft_cql_full_config.yaml           # SFT full FT
 ├── utils/
-│   ├── cql_rewards.py          # Reward functions (format + ngram + execution)
+│   ├── cql_rewards.py          # Reward functions (format + structure + fields + execution)
 │   ├── cql_validator.py         # CQL syntax validator
 │   ├── cql_tokenizer.py         # CQL semantic tokenizer
 │   ├── cql_data_processor.py    # NeMo RL data processor (system/user/assistant)

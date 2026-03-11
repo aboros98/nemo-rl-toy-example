@@ -1,11 +1,12 @@
 """CQL reward environment for NeMo RL — R1-style multi-component rewards.
 
-Three reward components (DeepSeek-R1 pattern):
-  1. N-gram similarity  — bigram F1 vs reference query (accuracy signal)
-  2. Format             — proper <think>...</think> reasoning tags (format signal)
-  3. Execution          — placeholder for Docker LogScale compilation (correctness signal)
+Four reward components (DeepSeek-R1 pattern):
+  1. Format    — proper <think>...</think> reasoning tags
+  2. Structure — Jaccard of pipeline function names (right operations)
+  3. Fields    — F1 of tags, field names, string literals (right data)
+  4. Execution — placeholder for Docker LogScale compilation
 
-Weights are configurable via env config. Default: ngram=0.8, format=0.2, execution=0.0.
+Weights configurable via env config. Default: format=0.1, structure=0.3, fields=0.6, execution=0.0.
 """
 
 import sys
@@ -38,13 +39,14 @@ class CQLEnvironmentMetadata(TypedDict):
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
-    """R1-style reward: format (think tags) + n-gram similarity + execution (placeholder)."""
+    """R1-style reward: format + structure + fields + execution (placeholder)."""
 
     def __init__(self, cfg: CQLEnvConfig):
         self.cfg = cfg
         self.weights = cfg.get("reward_weights", {
-            "format": 0.2,
-            "ngram": 0.8,
+            "format": 0.1,
+            "structure": 0.3,
+            "fields": 0.6,
             "execution": 0.0,
         })
 

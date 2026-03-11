@@ -22,11 +22,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.cql_rewards import (
     compute_combined_reward,
+    compute_field_reward,
     compute_format_reward,
-    compute_ngram_reward,
+    compute_structure_reward,
     extract_cql_from_response,
+    _extract_entities,
 )
-from utils.cql_tokenizer import tokenize as cql_tokenize, bigram_similarity
+from utils.cql_tokenizer import (
+    extract_function_names,
+    tokenize as cql_tokenize,
+    structural_similarity,
+)
 
 # ─── Load real training data ─────────────────────────────────────────────────
 
@@ -39,7 +45,7 @@ if DATA_PATH.exists():
 else:
     print(f"⚠ No training data at {DATA_PATH} — run scripts/fetch_data.py first")
 
-DEFAULT_WEIGHTS = {"format": 0.2, "ngram": 0.8, "execution": 0.0}
+DEFAULT_WEIGHTS = {"format": 0.1, "structure": 0.3, "fields": 0.6, "execution": 0.0}
 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
@@ -56,7 +62,8 @@ def score(response: str, reference: str = "", weights: dict = None) -> dict:
     print(f"  Has thinking:  {r['has_thinking']}")
     print(f"{'─' * 70}")
     print(f"  Format reward:    {r['format']:.2f}  × {w.get('format', 0):.1f}  = {r['format'] * w.get('format', 0):.3f}")
-    print(f"  N-gram reward:    {r['ngram']:.2f}  × {w.get('ngram', 0):.1f}  = {r['ngram'] * w.get('ngram', 0):.3f}")
+    print(f"  Structure reward: {r['structure']:.2f}  × {w.get('structure', 0):.1f}  = {r['structure'] * w.get('structure', 0):.3f}")
+    print(f"  Fields reward:    {r['fields']:.2f}  × {w.get('fields', 0):.1f}  = {r['fields'] * w.get('fields', 0):.3f}")
     print(f"  Execution reward: {r['execution']:.2f}  × {w.get('execution', 0):.1f}  = {r['execution'] * w.get('execution', 0):.3f}")
     print(f"{'─' * 70}")
     print(f"  ► TOTAL REWARD: {r['reward']:.3f}")
@@ -83,9 +90,13 @@ def show_example(idx: int = 0):
     print("2) Model wraps it in <think> tags (perfect format + perfect CQL):")
     score(f"<think>\nI need to write a query for {_trunc(nl, 40)}\n</think>\n{cql}", cql)
 
-    print("3) Model gets CQL partially right (missing tail):")
-    partial = " | ".join(cql.split(" | ")[:2])  # keep first 2 pipe stages
-    score(f"<think>partial attempt</think>\n{partial}", cql)
+    print("3) Model gets right functions but wrong fields:")
+    funcs = extract_function_names(cql)
+    if len(cql.split(" | ")) > 1:
+        wrong = "#event_simpleName=DnsRequest | " + " | ".join(f"{f}(wrongField)" for f in funcs[1:] if f)
+    else:
+        wrong = "#event_simpleName=DnsRequest"
+    score(f"<think>close but wrong data</think>\n{wrong}", cql)
 
     print("4) Model outputs garbage:")
     score("<think>I don't know</think>\nSELECT * FROM events", cql)
@@ -100,30 +111,30 @@ def compare(responses: list[str], reference: str, weights: dict = None):
     results = []
     for resp in responses:
         r = compute_combined_reward(resp, reference, w)
-        results.append((r["reward"], r["format"], r["ngram"], resp))
+        results.append((r["reward"], r["format"], r["structure"], r["fields"], resp))
 
     results.sort(key=lambda x: x[0], reverse=True)
 
-    print(f"\n{'═' * 80}")
+    print(f"\n{'═' * 90}")
     print(f"  GRPO Group — {len(responses)} rollouts for same prompt")
     print(f"  Reference: {_trunc(reference, 65)}")
-    print(f"{'═' * 80}")
-    print(f"  {'Rank':>4}  {'Reward':>7}  {'Fmt':>5}  {'Ngram':>6}  Response")
-    print(f"  {'─' * 74}")
+    print(f"{'═' * 90}")
+    print(f"  {'Rank':>4}  {'Reward':>7}  {'Fmt':>5}  {'Struc':>5}  {'Field':>5}  Response")
+    print(f"  {'─' * 84}")
     rewards = []
-    for i, (reward, fmt, ngram, resp) in enumerate(results):
+    for i, (reward, fmt, struc, fld, resp) in enumerate(results):
         rewards.append(reward)
         prefix = "  ►" if i == 0 else "   "
-        print(f"{prefix}{i+1:3d}   {reward:7.3f}  {fmt:5.1f}  {ngram:6.3f}  {_trunc(resp.replace(chr(10), ' '), 45)}")
+        print(f"{prefix}{i+1:3d}   {reward:7.3f}  {fmt:5.1f}  {struc:5.2f}  {fld:5.2f}  {_trunc(resp.replace(chr(10), ' '), 40)}")
 
     mean_r = sum(rewards) / len(rewards) if rewards else 0
-    print(f"  {'─' * 74}")
+    print(f"  {'─' * 84}")
     print(f"  Mean={mean_r:.3f}  Spread={max(rewards) - min(rewards):.3f}  "
           f"Std={_std(rewards):.3f}")
 
     # Show GRPO advantages
     print(f"\n  GRPO advantages (reward - mean):")
-    for i, (reward, _, _, resp) in enumerate(results):
+    for i, (reward, _, _, _, resp) in enumerate(results):
         adv = reward - mean_r
         bar = "█" * int(abs(adv) * 40)
         sign = "+" if adv >= 0 else "-"
@@ -141,57 +152,61 @@ def show_tokens(cql: str):
     print()
 
 
-def explain_ngram(a: str, b: str):
-    """Show exactly how bigram similarity is computed between two CQL strings."""
-    tokens_a = cql_tokenize(a)
-    tokens_b = cql_tokenize(b)
-
-    # Build bigrams from token values
-    vals_a = [t[0] if isinstance(t, tuple) else str(t) for t in tokens_a]
-    vals_b = [t[0] if isinstance(t, tuple) else str(t) for t in tokens_b]
-
-    bigrams_a = set(zip(vals_a, vals_a[1:])) if len(vals_a) >= 2 else set()
-    bigrams_b = set(zip(vals_b, vals_b[1:])) if len(vals_b) >= 2 else set()
-
-    overlap = bigrams_a & bigrams_b
-    only_a = bigrams_a - bigrams_b
-    only_b = bigrams_b - bigrams_a
-
-    sim = bigram_similarity(a, b)
+def explain_structure(a: str, b: str):
+    """Show how structure reward compares two CQL queries."""
+    funcs_a = extract_function_names(a)
+    funcs_b = extract_function_names(b)
+    sim = structural_similarity(a, b)
 
     print(f"\n{'─' * 60}")
     print(f"  A: {_trunc(a, 55)}")
     print(f"  B: {_trunc(b, 55)}")
     print(f"{'─' * 60}")
-    print(f"  Tokens A: {vals_a}")
-    print(f"  Tokens B: {vals_b}")
-    print(f"  Bigrams A: {len(bigrams_a)}  Bigrams B: {len(bigrams_b)}")
-    print(f"  Overlap:   {len(overlap)}")
-    if overlap:
-        print(f"    ✓ shared: {list(overlap)[:8]}{'...' if len(overlap) > 8 else ''}")
+    print(f"  Functions A: {funcs_a}")
+    print(f"  Functions B: {funcs_b}")
+    print(f"  Jaccard similarity: {sim:.4f}")
+    print(f"{'─' * 60}\n")
+
+
+def explain_fields(a: str, b: str):
+    """Show how field reward compares two CQL queries."""
+    ents_a = _extract_entities(a)
+    ents_b = _extract_entities(b)
+    overlap = ents_a & ents_b
+    only_a = ents_a - ents_b
+    only_b = ents_b - ents_a
+    sim = compute_field_reward(a, b)
+
+    print(f"\n{'─' * 60}")
+    print(f"  A: {_trunc(a, 55)}")
+    print(f"  B: {_trunc(b, 55)}")
+    print(f"{'─' * 60}")
+    print(f"  Entities A ({len(ents_a)}): {sorted(ents_a)[:10]}")
+    print(f"  Entities B ({len(ents_b)}): {sorted(ents_b)[:10]}")
+    print(f"  Shared ({len(overlap)}): {sorted(overlap)[:10]}")
     if only_a:
-        print(f"    - only in A: {list(only_a)[:5]}{'...' if len(only_a) > 5 else ''}")
+        print(f"  Only in A: {sorted(only_a)[:5]}")
     if only_b:
-        print(f"    - only in B: {list(only_b)[:5]}{'...' if len(only_b) > 5 else ''}")
-    print(f"  Dice coefficient: 2×{len(overlap)} / ({len(bigrams_a)}+{len(bigrams_b)}) = {sim:.4f}")
+        print(f"  Only in B: {sorted(only_b)[:5]}")
+    print(f"  F1 score: {sim:.4f}")
     print(f"{'─' * 60}\n")
 
 
 def sweep_weights(response: str, reference: str):
-    """Show how reward changes as format vs ngram weight shifts."""
-    print(f"\n{'═' * 60}")
-    print(f"  Weight sweep: format ← → ngram")
+    """Show how reward changes as structure vs fields weight shifts."""
+    print(f"\n{'═' * 65}")
+    print(f"  Weight sweep: structure ← → fields (format=0.1 fixed)")
     print(f"  Response:  {_trunc(response, 50)}")
     print(f"  Reference: {_trunc(reference, 50)}")
-    print(f"{'═' * 60}")
-    print(f"  {'Format W':>9}  {'Ngram W':>8}  {'Reward':>7}  {'Bar'}")
-    print(f"  {'─' * 50}")
-    for fmt_w in [i / 10 for i in range(11)]:
-        ngram_w = 1.0 - fmt_w
-        w = {"format": fmt_w, "ngram": ngram_w, "execution": 0.0}
+    print(f"{'═' * 65}")
+    print(f"  {'Struc W':>8}  {'Field W':>8}  {'Reward':>7}  {'Bar'}")
+    print(f"  {'─' * 55}")
+    for s_w in [i / 10 for i in range(10)]:
+        f_w = 0.9 - s_w  # remaining after format=0.1
+        w = {"format": 0.1, "structure": s_w, "fields": f_w, "execution": 0.0}
         r = compute_combined_reward(response, reference, w)
         bar = "█" * int(r["reward"] * 30)
-        print(f"  {fmt_w:>8.1f}   {ngram_w:>7.1f}   {r['reward']:7.3f}  {bar}")
+        print(f"  {s_w:>7.1f}   {f_w:>7.1f}   {r['reward']:7.3f}  {bar}")
     print()
 
 
@@ -206,6 +221,11 @@ def grpo_sim(reference: str, n_rollouts: int = 8):
     rollouts.append(f"<think>I'll construct the full query</think>\n{reference}")
     # Perfect without think
     rollouts.append(reference)
+    # Right structure, wrong fields
+    funcs = extract_function_names(reference)
+    if funcs:
+        wrong_fields = "#event_simpleName=DnsRequest | " + " | ".join(f"{f}(wrongField)" for f in funcs[1:] if f)
+        rollouts.append(f"<think>close but wrong data</think>\n{wrong_fields}")
     # Partial (first N-1 stages)
     if len(cql_parts) > 1:
         partial = " | ".join(cql_parts[:-1])
@@ -213,7 +233,7 @@ def grpo_sim(reference: str, n_rollouts: int = 8):
     # Wrong but valid-looking
     rollouts.append("<think>let me try</think>\n#event=Unknown | count()")
     # Only thinking
-    rollouts.append("<think>I need to think about this more carefully but I'm not sure what the right approach is</think>")
+    rollouts.append("<think>I need to think about this more carefully</think>")
     # Garbage
     rollouts.append("SELECT * FROM events WHERE type = 'dns'")
     # Empty
@@ -304,33 +324,34 @@ def main():
     print("▸" * 35)
     show_example(0)
 
-    # ── Demo 2: Tokenizer internals ──
+    # ── Demo 2: Tokenizer + entity extraction ──
     print("\n" + "▸" * 35)
-    print("  DEMO 2: How the CQL tokenizer works")
+    print("  DEMO 2: How the CQL tokenizer and entity extraction work")
     print("▸" * 35)
     ref = EXAMPLES[0]["cql_query"]
     show_tokens(ref)
+    print("  Extracted entities (tags, fields, strings — NOT function names):")
+    ents = _extract_entities(ref)
+    print(f"    {sorted(ents)}")
+    print(f"\n  Pipeline functions:")
+    print(f"    {extract_function_names(ref)}")
 
-    # ── Demo 3: N-gram similarity step by step ──
+    # ── Demo 3: Structure + field comparison step by step ──
     print("\n" + "▸" * 35)
-    print("  DEMO 3: N-gram similarity — step by step")
+    print("  DEMO 3: Structure and field rewards — step by step")
     print("▸" * 35)
-    parts = ref.split(" | ")
-    if len(parts) > 2:
-        partial = " | ".join(parts[:2])
-    else:
-        partial = parts[0] if parts else ""
-    explain_ngram(ref, ref)               # identical
-    explain_ngram(partial, ref)            # partial match
-    explain_ngram("SELECT * FROM x", ref)  # completely different
+    explain_structure(ref, ref)
+    if len(ref.split(" | ")) > 2:
+        partial = " | ".join(ref.split(" | ")[:2])
+        explain_structure(partial, ref)
+    explain_fields(ref, ref)
+    explain_fields("#event_simpleName=DnsRequest | groupBy(DomainName)", ref)
 
     # ── Demo 4: Weight sweep ──
     print("\n" + "▸" * 35)
     print("  DEMO 4: How weights change the reward")
     print("▸" * 35)
-    # Good CQL with think tags
     sweep_weights(f"<think>reasoning</think>\n{ref}", ref)
-    # Wrong CQL with think tags — format can't save you
     sweep_weights(f"<think>reasoning</think>\nSELECT * FROM events", ref)
 
     # ── Demo 5: GRPO group simulation ──
@@ -339,22 +360,24 @@ def main():
     print("▸" * 35)
     grpo_sim(ref, 8)
 
-    # ── Demo 6: Key insights ──
+    # ── Key insights ──
     print("\n" + "▸" * 35)
     print("  KEY INSIGHTS")
     print("▸" * 35)
     print("""
-    1. N-gram (0.8 weight) is the primary signal — accuracy matters most
-    2. Format (0.2 weight) adds +0.20 for <think> tags — a small but consistent bonus
-    3. After extraction, only the CQL after </think> is compared to the reference
-    4. The tokenizer treats #tags, function names, and quoted strings as atomic units
-    5. Empty responses score 0.0 — GRPO pushes away from them
-    6. In a GRPO group, SPREAD matters: diverse rewards → strong gradient signal
+    1. Fields (0.6 weight) is the primary signal — did you reference the right data?
+    2. Structure (0.3 weight) — did you use the right CQL operations?
+    3. Format (0.1 weight) adds +0.10 for <think> tags — consistent bonus
+    4. Structure rewards equivalent queries that use different syntax
+    5. Fields rewards queries that reference the right event types and field names
+    6. Empty responses score 0.0 — GRPO pushes away from them
+    7. In a GRPO group, SPREAD matters: diverse rewards → strong gradient signal
 
     To play interactively:
         from notebooks.reward_playground import *
         score("<think>reasoning</think>\\n#event=X | count()", "#event=X | count()")
-        show_example(5)
+        explain_structure("where x>1 | count()", "where x>1 | groupBy(y)")
+        explain_fields("#event=X | where y=1", "#event=X | where z=2")
         grpo_sim("#event=DnsRequest | groupBy(DomainName) | head(100)")
         interactive()  # type responses, see rewards live
     """)

@@ -107,7 +107,7 @@ All tunables for GRPO and SFT training with NeMo RL. Organized by category.
 |-----------|-----------|---------|-------|
 | Env workers | `env.cql.num_workers` | 8 | Ray actors for reward computation |
 
-The CQL environment returns: 1.0 for syntactically valid CQL, 0.0 for invalid. Future: add ngram similarity, mock execution scoring.
+The CQL environment returns: structure Jaccard + field F1 + format reward. Future: add execution scoring via Docker LogScale.
 
 ---
 

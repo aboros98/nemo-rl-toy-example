@@ -48,8 +48,9 @@ _COMBINED_PATTERN = "|".join(f"(?P<T{i}>{pat})" for i, (pat, _) in enumerate(_PA
 _COMPILED = re.compile(_COMBINED_PATTERN)
 _TOKEN_TYPE_MAP = {f"T{i}": ttype for i, (_, ttype) in enumerate(_PATTERNS)}
 
-# Pattern to detect function calls: identifier followed by (
-_FUNCTION_CALL_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_.]*)(?:\(|$)")
+# Pattern to detect pipeline stage names: first identifier in a stage
+# Captures both function-style (groupBy(...)) and keyword-style (where ..., sort ...)
+_PIPELINE_STAGE_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_.]*)")
 
 
 def tokenize(cql: str) -> list[str]:
@@ -95,26 +96,24 @@ def tokenize_typed(cql: str) -> list[tuple[str, str]]:
 
 
 def extract_function_names(cql: str) -> list[str]:
-    """Extract the ordered list of function names from a CQL pipeline.
+    """Extract the ordered list of function/keyword names from a CQL pipeline.
 
-    Identifies function calls by looking for identifiers followed by '('.
-    Only considers top-level pipeline functions (those after | or at start).
+    Identifies the first identifier in each pipeline stage, capturing both
+    function-style calls (groupBy(...)) and keyword-style (where ..., sort ...).
 
     Args:
         cql: A CQL query string.
 
     Returns:
-        Ordered list of function names in the pipeline.
+        Ordered list of pipeline stage names.
     """
     functions = []
-    # Split by pipe to get pipeline stages
     stages = cql.split("|")
     for stage in stages:
         stage = stage.strip()
         if not stage:
             continue
-        # The function name is the first identifier in the stage
-        m = _FUNCTION_CALL_RE.match(stage)
+        m = _PIPELINE_STAGE_RE.match(stage)
         if m:
             functions.append(m.group(1))
     return functions

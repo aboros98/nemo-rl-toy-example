@@ -169,7 +169,7 @@ For each step:
   1. Sample prompts from data/train.jsonl
   2. Format: system_prompt + nl_query → tokenize with chat template
   3. vLLM generates N completions per prompt (num_generations_per_prompt)
-  4. Each completion → reward server → {syntax, execution, ngram} → combined reward
+  4. Each completion → reward environment → {format, structure, fields} → combined reward
   5. GRPO advantage = reward - mean(rewards for this prompt)
   6. Policy gradient update with clipped ratio (Clip-Higher: 0.2/0.28)
   7. Log metrics to TensorBoard / W&B

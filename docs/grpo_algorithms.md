@@ -558,7 +558,7 @@ Is your task binary-reward (pass/fail)?
 ### For CQL specifically
 
 CQL queries are **short** (10-50 tokens), our rewards are **continuous** [0, 1],
-and we have **three reward components** (syntax, execution, ngram). This means:
+and we have **four reward components** (format, structure, fields, execution). This means:
 
 - Length bias is minimal → Dr. GRPO's fix doesn't matter much
 - Zero-variance groups are rare (continuous rewards) → dynamic sampling helps less

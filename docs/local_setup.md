@@ -109,7 +109,7 @@ python -m pytest utils/ -v
 Expected: **69 passed**. These test:
 - CQL syntax validator (balanced parens, valid pipes, known functions, unclosed strings)
 - CQL tokenizer (semantic tokenization, bigram similarity, structural similarity)
-- Reward functions (format, ngram, combined, invariants)
+- Reward functions (format, structure, fields, combined, invariants)
 
 To run a specific test file:
 ```bash
@@ -130,7 +130,7 @@ This runs the **exact same reward logic** the GPU training will use (`utils/cql_
 
 Output:
 ```
-Reward weights: format=0.2, ngram=0.8, execution=0.0
+Reward weights: format=0.1, structure=0.3, fields=0.6, execution=0.0
 
 === Ground truth queries (no <think> tags) — 10 examples ===
   #   Total    Fmt  Ngram  Query (first 60 chars)
@@ -160,7 +160,7 @@ Options:
 ```bash
 python scripts/test_rewards_local.py --n 50                    # Test 50 examples
 python scripts/test_rewards_local.py --data data/val.jsonl     # Test on validation set
-python scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.7,"execution":0.0}'  # Custom weights
+python scripts/test_rewards_local.py --weights '{"format":0.1,"structure":0.4,"fields":0.5,"execution":0.0}'  # Custom weights
 ```
 
 ### How to iterate on rewards
@@ -208,7 +208,7 @@ The reward playground lets you experiment with different inputs and see how rewa
 python notebooks/reward_playground.py
 ```
 
-Runs 5 demos (same query scored 5 ways, tokenizer internals, ngram math, weight sweep, GRPO simulation) then drops into a REPL where you can call `score()`, `compare()`, `sweep_weights()`, etc.
+Runs 5 demos (same query scored 5 ways, tokenizer internals, structure/field comparison, weight sweep, GRPO simulation) then drops into a REPL where you can call `score()`, `compare()`, `sweep_weights()`, etc.
 
 ---
 
@@ -260,7 +260,7 @@ vim utils/cql_rewards.py
 python scripts/test_rewards_local.py
 
 # 4. Try different weights
-python scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.5,"execution":0.2}'
+python scripts/test_rewards_local.py --weights '{"format":0.1,"structure":0.2,"fields":0.3,"execution":0.4}'
 
 # 5. Run unit tests to make sure nothing broke
 python -m pytest utils/ -v

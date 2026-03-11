@@ -345,8 +345,9 @@ tensorboard --logdir logs/ --port 6006
 ## Existing Example: CQL Environment
 
 See `environments/cql_environment.py` — R1-style multi-component reward (~98 lines):
-- **Format reward** (0.2 weight): `<think>...</think>` tag presence → 0.0 / 0.5 / 1.0
-- **N-gram reward** (0.8 weight): bigram F1 vs reference CQL using semantic tokenizer
+- **Format reward** (0.1 weight): `<think>...</think>` tag presence → 0.0 / 0.5 / 1.0
+- **Structure reward** (0.3 weight): Jaccard of pipeline function names (right operations)
+- **Fields reward** (0.6 weight): F1 of tags, field names, string literals (right data)
 - **Execution reward** (0.0 weight): placeholder for Docker LogScale compilation
 
 Reward logic lives in `utils/cql_rewards.py` (pure Python, no GPU deps — testable on Mac).
@@ -354,8 +355,8 @@ Reward logic lives in `utils/cql_rewards.py` (pure Python, no GPU deps — testa
 ```python
 from utils.cql_rewards import compute_combined_reward
 
-result = compute_combined_reward(response, reference_cql, weights={"format": 0.2, "ngram": 0.8, "execution": 0.0})
-# result = {"reward": 0.84, "format": 1.0, "ngram": 0.8, "execution": 0.0, "extracted_cql": "...", "has_thinking": True}
+result = compute_combined_reward(response, reference_cql, weights={"format": 0.1, "structure": 0.3, "fields": 0.6, "execution": 0.0})
+# result = {"reward": 0.84, "format": 1.0, "structure": 0.8, "fields": 0.9, "execution": 0.0, "extracted_cql": "...", "has_thinking": True}
 ```
 
 ---

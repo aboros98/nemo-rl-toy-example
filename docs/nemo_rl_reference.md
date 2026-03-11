@@ -250,7 +250,7 @@ In our CQL pipeline, we also log:
 logger.log_metrics({
     "syntax_valid_pct": 0.85,      # % of completions that are valid CQL
     "execution_success_pct": 0.72,  # % that "executed" successfully
-    "ngram_similarity_mean": 0.61,  # Average bigram similarity to gold
+    "structure_similarity_mean": 0.72,  # Average pipeline function Jaccard
 }, step=step)
 ```
 
@@ -443,7 +443,7 @@ uv run examples/run_grpo.py \
 
 1. **Stage training by context length** — don't start at max length
 2. **Evaluate frequently** — convert checkpoints to HF format, run AIME24 benchmark
-3. **Reward must be verifiable** — math uses symbolic equivalence, we use CQL syntax+ngram
+3. **Reward must be verifiable** — math uses symbolic equivalence, we use CQL structure+fields matching
 4. **Group size matters** — K=16 or K=32 generations per prompt gives stable advantages
 5. **Dynamic sampling is essential** — binary rewards create many zero-variance groups
 
