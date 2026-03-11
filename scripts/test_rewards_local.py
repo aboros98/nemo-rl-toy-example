@@ -92,7 +92,7 @@ def main():
     # --- Test 4: format reward incentive check ---
     print("\n=== Incentive check: does <think> get higher reward? ===")
     r_bare = compute_combined_reward(gt0, gt0, weights)
-    r_think = compute_combined_reward(f"<think>reasoning</think>\n{gt0}", gt0, weights)
+    r_think = compute_combined_reward(f"<think>I need to filter events by type and aggregate</think>\n{gt0}", gt0, weights)
     print(f"  Bare CQL:         reward={r_bare['reward']:.3f} (format={r_bare['format']:.1f}, ngram={r_bare['ngram']:.2f})")
     print(f"  With <think> tags: reward={r_think['reward']:.3f} (format={r_think['format']:.1f}, ngram={r_think['ngram']:.2f})")
     delta = r_think["reward"] - r_bare["reward"]

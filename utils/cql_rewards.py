@@ -25,7 +25,7 @@ def extract_cql_from_response(response: str) -> tuple[str, str | None]:
     if match:
         thinking = match.group(1).strip()
         after_think = response[match.end():].strip()
-        return (after_think if after_think else response, thinking)
+        return (after_think, thinking)  # may be empty string if no CQL after tags
 
     return (response, None)
 
@@ -35,8 +35,8 @@ def compute_format_reward(response: str) -> float:
 
     Returns float in [0, 1]:
       - 0.0: no think tags at all
-      - 0.5: has opening <think> but no closing </think>
-      - 1.0: properly paired <think>...</think>
+      - 0.5: partial (open only, wrong order, or empty/trivial thinking)
+      - 1.0: properly paired with substantive thinking (≥10 chars)
     """
     has_open = "<think>" in response
     has_close = "</think>" in response
@@ -45,7 +45,9 @@ def compute_format_reward(response: str) -> float:
         open_pos = response.index("<think>")
         close_pos = response.index("</think>")
         if close_pos > open_pos:
-            return 1.0
+            # Check thinking is substantive (prevent empty <think></think> hacking)
+            thinking = response[open_pos + len("<think>"):close_pos].strip()
+            return 1.0 if len(thinking) >= 10 else 0.5
         return 0.5
     elif has_open:
         return 0.5
