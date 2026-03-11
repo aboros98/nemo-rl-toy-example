@@ -1,45 +1,89 @@
-# Creating Custom Reward Environments
+# Creating Reward Environments for GRPO Training
 
-How to build, register, and use your own reward environments for GRPO training.
+This doc explains how to write a reward environment — the component that scores
+model outputs during GRPO training. Two approaches exist: **NeMo RL environments**
+(Ray actors, what we use) and **NeMo Gym resource servers** (HTTP/FastAPI). Both
+work with NeMo RL training.
 
 ---
 
-## Two Approaches
+## Quick Orientation
 
-There are **two different ways** to create reward environments in the NVIDIA stack:
+During GRPO training, this is what happens every step:
+
+```
+1. Dataloader picks prompts from train.jsonl
+   → each prompt has metadata (e.g., ground_truth CQL query)
+
+2. vLLM generates N rollouts per prompt
+   → model produces text like "<think>...</think>\n#event=..."
+
+3. YOUR ENVIRONMENT scores each rollout        ← you write this
+   → receives: conversation + metadata
+   → returns: reward float per rollout
+
+4. GRPO computes advantages, updates policy weights
+```
+
+**You only write step 3.** Everything else is handled by NeMo RL.
+
+### Two Approaches
 
 | | NeMo RL Environment | NeMo Gym Resource Server |
 |---|---|---|
 | **Repo** | [NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL) | [NVIDIA-NeMo/Gym](https://github.com/NVIDIA-NeMo/Gym) |
-| **Pattern** | Ray actor implementing `EnvironmentInterface` | FastAPI server subclassing `SimpleResourcesServer` |
-| **Method** | `step(message_log_batch, metadata)` → `EnvironmentReturn` | `async verify(body: BaseVerifyRequest)` → `BaseVerifyResponse` |
-| **Communication** | In-process (Ray) | HTTP (`/verify` endpoint) |
-| **Best for** | Pure-Python rewards, fast scoring | External services, LLM judges, sandboxed execution |
-| **We use** | ✅ This one (`environments/cql_environment.py`) | Not yet (planned for LogScale Docker) |
-
-**NeMo RL has a built-in bridge**: the `nemo_gym` environment type in NeMo RL wraps any NeMo Gym resource server as a standard `EnvironmentInterface`, so you can use either approach with NeMo RL training.
+| **Pattern** | Python class (Ray actor) | FastAPI HTTP server |
+| **Method you write** | `step(conversations, metadata) → rewards` | `async verify(request) → reward` |
+| **Communication** | In-process via Ray | HTTP POST to `/verify` |
+| **Best for** | Fast pure-Python rewards | External services, LLM judges, sandboxed execution |
+| **We use** | ✅ `environments/cql_environment.py` | Planned for LogScale Docker compilation |
 
 ---
 
-## Approach 1: NeMo RL Environment (Ray Actor) — What We Use
+## Approach 1: NeMo RL Environment (What We Use)
 
+A NeMo RL environment is a Python class decorated with `@ray.remote` that
+implements two methods:
+- `step()` — score a batch of model outputs
+- `global_post_process_and_metrics()` — compute logging metrics
+
+### What the Data Looks Like
+
+When NeMo RL calls your `step()`, here is what you receive:
+
+```python
+# message_log_batch — a list of conversations (one per rollout)
+# Each conversation is a list of message dicts:
+message_log_batch = [
+    # Rollout 1:
+    [
+        {"role": "user", "content": "Generate a CQL query that finds DNS requests..."},
+        {"role": "assistant", "content": "<think>I need to filter DnsRequest events...</think>\n"
+                                      "#event_simpleName=DnsRequest | where DomainName=/.*malware.*/"},
+    ],
+    # Rollout 2 (same prompt, different model response):
+    [
+        {"role": "user", "content": "Generate a CQL query that finds DNS requests..."},
+        {"role": "assistant", "content": "SELECT * FROM dns WHERE domain LIKE '%malware%'"},
+    ],
+    # ... more rollouts
+]
+
+# metadata — one dict per rollout, comes from your data processor
+metadata = [
+    {"ground_truth": "#event_simpleName=DnsRequest | where DomainName=/.*malware.*/"},
+    {"ground_truth": "#event_simpleName=DnsRequest | where DomainName=/.*malware.*/"},
+]
 ```
-GRPO loop:
-  1. Sample prompts from dataset
-  2. Generate N rollouts per prompt (vLLM)
-  3. Send rollouts to YOUR ENVIRONMENT → get rewards    ← you write this
-  4. Compute advantages, update policy
-```
 
-Your environment is a **Ray actor**. NeMo RL calls `step()` with a batch of conversations, you return rewards. That's it.
+Your job: compare each assistant response to the ground truth and return a reward.
 
----
+### Step-by-Step: Create Your Environment
 
-## Minimal Template
+#### 1. Write the environment class
 
 ```python
 """environments/my_reward.py"""
-
 import ray
 import torch
 from typing import Any, TypedDict
@@ -49,16 +93,16 @@ from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentRet
 
 
 class MyMetadata(TypedDict):
-    ground_truth: str          # whatever your env needs per sample
-    # add more fields as needed
+    ground_truth: str
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class MyRewardEnv(EnvironmentInterface[MyMetadata]):
+    """Called by NeMo RL to score rollouts during GRPO training."""
 
     def __init__(self, cfg: dict):
+        # cfg comes from your YAML: env.my_reward.*
         self.cfg = cfg
-        # Load models, validators, API clients, etc.
 
     def step(
         self,
@@ -67,157 +111,264 @@ class MyRewardEnv(EnvironmentInterface[MyMetadata]):
         **kwargs,
     ) -> EnvironmentReturn[MyMetadata]:
         rewards = []
-        responses = []
+        answers = []
+
         for conversation, meta in zip(message_log_batch, metadata):
-            # Extract the model's response (last assistant message)
+            # 1. Extract the model's response (concatenate all assistant messages)
             response = "".join(
                 str(m["content"]) for m in conversation if m["role"] == "assistant"
             )
-            responses.append(response)
 
-            # ---- YOUR REWARD LOGIC HERE ----
-            score = self.compute_reward(response, meta["ground_truth"])
+            # 2. Score it against the ground truth
+            ground_truth = meta["ground_truth"]
+            score = 1.0 if response.strip() == ground_truth.strip() else 0.0
+
             rewards.append(score)
+            answers.append(response.strip())
 
-        rewards_t = torch.tensor(rewards, dtype=torch.float32).cpu()
-        terminateds = torch.ones(len(rewards), dtype=torch.float32).cpu()
-
-        observations = [
-            {"role": "environment", "content": f"reward={r:.2f}"}
-            for r in rewards
-        ]
-        answers = [r.strip() for r in responses]
-
+        # 3. Return all 6 required fields
         return EnvironmentReturn(
-            observations=observations,
-            metadata=metadata,
-            next_stop_strings=[None] * len(message_log_batch),
-            rewards=rewards_t,
-            terminateds=terminateds,
-            answers=answers,
+            observations=[{"role": "environment", "content": f"reward={r:.2f}"} for r in rewards],
+            metadata=metadata,                                  # pass through (single-turn)
+            next_stop_strings=[None] * len(message_log_batch),  # no stop strings (single-turn)
+            rewards=torch.tensor(rewards).cpu(),                # MUST be on CPU
+            terminateds=torch.ones(len(rewards)).cpu(),         # 1.0 = episode done
+            answers=answers,                                    # extracted answers for logging
         )
-
-    def compute_reward(self, response: str, ground_truth: str) -> float:
-        """Replace with your actual reward logic."""
-        return 1.0 if response.strip() == ground_truth.strip() else 0.0
 
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        # IMPORTANT: mask rewards for sequences that didn't end properly
+        # Zero out rewards for rollouts that didn't finish properly
         batch["rewards"] = batch["rewards"] * batch["is_end"]
 
-        metrics = {
+        return batch, {
             "accuracy": batch["rewards"].mean().item(),
             "fraction_ended": batch["is_end"].float().mean().item(),
             "mean_gen_length": batch["generation_lengths"].float().mean().item(),
         }
-        return batch, metrics
 
     def shutdown(self) -> None:
-        pass
+        pass  # cleanup if needed
 ```
 
----
-
-## How to Register & Use
-
-In your training script, **before** calling the GRPO loop:
+#### 2. Register it in your training script
 
 ```python
+# scripts/run_grpo.py — BEFORE calling grpo_train()
 from nemo_rl.environments.utils import register_env
-
-# FQN = fully qualified name: "module.path.ClassName"
 register_env("my_reward", "environments.my_reward.MyRewardEnv")
 ```
 
-In your YAML config, two things connect:
+#### 3. Configure it in YAML
 
 ```yaml
-# 1. Environment config — passed as cfg dict to __init__
-env:
-  my_reward:         # must match the name in register_env()
-    num_workers: 8   # Ray actors for parallel reward eval
+# Two things must connect:
 
-# 2. Data config — tells NeMo RL which env to use for this dataset
+# A. Environment config — passed as cfg dict to __init__()
+env:
+  my_reward:           # must match register_env("my_reward", ...)
+    num_workers: 8
+
+# B. Data config — tells which env to use for this dataset
 data:
   default:
     env_name: "my_reward"   # must match the key under env:
     processor: "my_data_processor"
 ```
 
-That's it. NeMo RL handles actor creation, batching, and lifecycle.
+That is it. NeMo RL creates Ray actors, batches rollouts, calls `step()`, and
+feeds rewards into the GRPO loss.
 
 ---
 
-## The Two Methods You Must Implement
+### Real Example: Our CQL Environment
 
-### `step()` — Score a batch of rollouts
+Here is the actual flow through `environments/cql_environment.py`, annotated:
 
-**Input:**
-- `message_log_batch`: list of conversations, each is a list of `{"role": ..., "content": ...}` dicts
-- `metadata`: list of per-sample metadata (ground truth, test cases, etc.)
-
-**Output:** `EnvironmentReturn` with:
-| Field | Type | Description |
-|-------|------|-------------|
-| `observations` | `list[dict]` | Feedback messages (logged, not used for training) |
-| `metadata` | `list[dict]` | Updated metadata (pass through if single-turn) |
-| `next_stop_strings` | `list[None]` | Stop strings for next turn (`[None]*N` for single-turn) |
-| `rewards` | `torch.Tensor` | Shape `[batch_size]`, **must be on CPU** |
-| `terminateds` | `torch.Tensor` | Shape `[batch_size]`, 1.0 = episode done |
-| `answers` | `list[str]` | Extracted answers (model responses or post-processed text) |
-
-**Typical pattern for single-turn reward (most common):**
 ```python
-rewards = torch.tensor([score1, score2, ...]).cpu()
-terminateds = torch.ones_like(rewards).cpu()  # always done after 1 turn
+@ray.remote(max_restarts=-1, max_task_retries=-1)
+class CQLEnvironment(EnvironmentInterface[CQLEnvironmentMetadata]):
+
+    def __init__(self, cfg: CQLEnvConfig):
+        self.cfg = cfg
+        # Weights come from YAML: env.cql.reward_weights
+        self.weights = cfg.get("reward_weights", {
+            "format": 0.1, "structure": 0.3, "fields": 0.6, "execution": 0.0,
+        })
+
+    def step(self, message_log_batch, metadata, **kwargs):
+        rewards_list, answers = [], []
+
+        for conversation, meta in zip(message_log_batch, metadata):
+            # Concatenate all assistant turns into one string
+            response = "".join(
+                str(m["content"]) for m in conversation if m["role"] == "assistant"
+            )
+            reference = meta.get("ground_truth", "")
+
+            # compute_combined_reward is pure Python — same function used
+            # by test_rewards_local.py and the reward playground
+            result = compute_combined_reward(response, reference, self.weights)
+            rewards_list.append(result["reward"])
+            answers.append(result["extracted_cql"])
+
+        return EnvironmentReturn(
+            observations=[...],  # see full code in environments/cql_environment.py
+            metadata=metadata,
+            next_stop_strings=[None] * len(message_log_batch),
+            rewards=torch.tensor(rewards_list).cpu(),
+            terminateds=torch.ones_like(torch.tensor(rewards_list)).cpu(),
+            answers=answers,
+        )
 ```
 
-### `global_post_process_and_metrics()` — Compute logging metrics
+**Concrete walkthrough — what happens when rollouts arrive:**
 
-Called once per training step after all rollouts are scored. The `batch` dict contains:
+```
+Golden query:
+  #event_simpleName=ProcessRollup2 | where FileName="cmd.exe" | groupBy(ComputerName)
 
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `rewards` | `[B]` | Raw rewards from `step()` |
-| `is_end` | `[B]` | Whether generation ended properly (hit EOS/stop string) |
-| `generation_lengths` | `[B]` | Token count of each generation |
-| `prompt_lengths` | `[B]` | Token count of each prompt |
+─────────────────────────────────────────────────────────────────────
+
+Rollout A (perfect match with reasoning):
+  "<think>I need process events for cmd.exe</think>
+   #event_simpleName=ProcessRollup2 | where FileName="cmd.exe" | groupBy(ComputerName)"
+
+  Step 1: extract_cql_from_response() strips <think>...</think> tags
+  Step 2: compute_format_reward()     → 1.0  (both <think> and </think> present)
+  Step 3: compute_structure_reward()  → 1.0  (functions: [where, groupBy] — exact match)
+  Step 4: compute_field_reward()      → 1.0  (entities: {processrollup2, filename, "cmd.exe",
+                                               computername} — all match)
+  Combined = 0.1 × 1.0 + 0.3 × 1.0 + 0.6 × 1.0 = 1.0
+
+─────────────────────────────────────────────────────────────────────
+
+Rollout B (partial match — wrong event type):
+  "<think>Let me try</think>
+   #event_simpleName=DnsRequest | where FileName="cmd.exe""
+
+  format:     1.0  (tags present)
+  structure:  0.33 (functions: [where] — missing groupBy)
+  fields:     0.57 (entities: {dnsrequest, filename, "cmd.exe"} — wrong event, missing computername)
+  Combined = 0.1 × 1.0 + 0.3 × 0.33 + 0.6 × 0.57 = 0.54
+
+─────────────────────────────────────────────────────────────────────
+
+Rollout C (SQL instead of CQL — wrong language):
+  "SELECT * FROM processes WHERE name = 'cmd.exe'"
+
+  format:     0.0  (no <think>...</think> tags)
+  structure:  0.0  (no CQL functions found)
+  fields:     0.0  (no matching entities)
+  Combined = 0.0
+```
+
+**GRPO uses the reward differences** — the model learns that Rollout A (1.0) is
+better than B (0.54), which is better than C (0.0). Over training, it stops
+generating SQL and starts producing correct CQL with reasoning.
+
+---
+
+### The Four Reward Components (Our CQL System)
+
+All reward logic lives in `utils/cql_rewards.py` (pure Python, no GPU needed):
+
+| Component | Weight | Measures | Range |
+|-----------|--------|----------|-------|
+| **Format** | 0.1 | `<think>...</think>` tag presence | 0.0 (none), 0.5 (one tag), 1.0 (both) |
+| **Structure** | 0.3 | Jaccard similarity of pipeline function names | 0.0 – 1.0 |
+| **Fields** | 0.6 | F1 score of tags, field names, string literals | 0.0 – 1.0 |
+| **Execution** | 0.0 | Placeholder for Docker LogScale compilation | Always 0.0 |
+
+**Structure reward** answers: "Did the model use the right operations?"
+- Extracts ordered function names like `[where, groupBy, count]` from both queries
+- Computes Jaccard similarity: |intersection| / |union|
+- Example: golden has `[where, groupBy]`, model has `[where, count]` → 1/3 = 0.33
+
+**Fields reward** answers: "Did the model reference the right data?"
+- Extracts entities: #tag values, field names (identifiers), string literals
+- Computes F1 score between the two entity sets
+- Example: golden `{processrollup2, filename, "cmd.exe"}`, model `{dnsrequest, filename, "cmd.exe"}` → precision 2/3, recall 2/3, F1 = 0.67
+
+Weights are configurable in YAML:
+```yaml
+env:
+  cql:
+    reward_weights:
+      format: 0.1      # encourage chain-of-thought reasoning
+      structure: 0.3    # right CQL operations
+      fields: 0.6      # right data/entities
+      execution: 0.0    # disabled until we have LogScale Docker
+```
+
+---
+
+### EnvironmentReturn Fields Reference
+
+`step()` must return a NamedTuple with exactly these 6 fields:
+
+| # | Field | Type | Description |
+|---|-------|------|-------------|
+| 1 | `observations` | `list[dict]` | `{"role": "environment", "content": "..."}` — logged, not used for training |
+| 2 | `metadata` | `list[dict]` | Pass through unchanged for single-turn; update for multi-turn |
+| 3 | `next_stop_strings` | `list[None]` | `[None] * batch_size` for single-turn tasks |
+| 4 | `rewards` | `Tensor` | Shape `[batch_size]` — **must be on CPU**, float32 |
+| 5 | `terminateds` | `Tensor` | Shape `[batch_size]` — `1.0` = episode done (always 1.0 for single-turn) |
+| 6 | `answers` | `list[str or None]` | Extracted answers — the "answer" part of each response |
+
+### The `global_post_process_and_metrics()` Method
+
+Called once per training step after all rollouts are scored.
 
 **Critical line** — always include this:
 ```python
 batch["rewards"] = batch["rewards"] * batch["is_end"]
 ```
-This zeros out rewards for sequences that didn't terminate properly (e.g., hit max length without producing a complete answer). Without this, you reward incomplete garbage.
+This zeros out rewards for rollouts that did not terminate properly (e.g., hit max
+token length without producing EOS). Without it, you reward incomplete garbage.
 
-The returned `metrics` dict is logged to TensorBoard automatically.
+The `batch` dict contains:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `rewards` | `[B]` | Rewards from your `step()` |
+| `is_end` | `[B]` | 1.0 if generation ended properly, 0.0 otherwise |
+| `generation_lengths` | `[B]` | Number of tokens generated per rollout |
+| `prompt_lengths` | `[B]` | Number of tokens in each prompt |
+
+Everything you return in the `metrics` dict gets logged to TensorBoard/W&B:
+
+```python
+return batch, {
+    "mean_reward": batch["rewards"].mean().item(),
+    "reward_std": batch["rewards"].std().item(),
+    "pct_perfect": (batch["rewards"] == 1.0).float().mean().item(),
+    "fraction_ended": batch["is_end"].float().mean().item(),
+    "generation_lengths": batch["generation_lengths"].float().mean().item(),
+}
+```
 
 ---
 
-## Reward Design Patterns
+### Reward Design Patterns
 
-### Pattern 1: Binary (exact match)
+#### Pattern 1: Binary (exact match)
 ```python
-def compute_reward(self, response, ground_truth):
-    return 1.0 if response.strip() == ground_truth.strip() else 0.0
+score = 1.0 if response.strip() == ground_truth.strip() else 0.0
 ```
-Good for: math, factual QA, code that must match exactly.
+Good for: math, factual QA. This is what NeMo RL's built-in `MathEnvironment` uses.
 
-### Pattern 2: Graded (partial credit)
+#### Pattern 2: Multi-component (partial credit)
 ```python
-def compute_reward(self, response, ground_truth):
-    score = 0.0
-    if is_syntactically_valid(response):
-        score += 0.3
-    if passes_unit_tests(response):
-        score += 0.4
-    score += 0.3 * similarity(response, ground_truth)
-    return min(score, 1.0)
+score  = 0.1 * format_score     # did the model show reasoning?
+score += 0.3 * structure_score   # right operations/functions?
+score += 0.6 * field_score       # right data/entities?
 ```
-Good for: code generation, structured output, CQL.
+Good for: structured output (CQL, SQL, code). This is what our CQL environment uses.
+The key invariant: **invalid must always score lower than valid**.
 
-### Pattern 3: LLM-as-judge
+#### Pattern 3: LLM-as-judge
 ```python
 def __init__(self, cfg):
     self.judge_client = openai.Client(base_url=cfg["judge_url"])
@@ -231,25 +382,52 @@ def compute_reward(self, response, ground_truth):
 ```
 Good for: open-ended tasks, style, helpfulness. Slow — use sparingly.
 
-### Pattern 4: Multi-component with structural matching
+#### Pattern 4: Execution-based
 ```python
-def compute_reward(self, response, ground_truth):
-    # Hard constraint: invalid syntax → capped at 0.0
-    if not is_valid_syntax(response):
-        return 0.0
-
-    # Soft rewards for valid syntax
-    score = 0.0
-    score += 0.3 * structural_similarity(response, ground_truth)  # right operations
-    score += 0.6 * field_f1(response, ground_truth)               # right data
-    score += 0.1 * format_compliance(response)                    # reasoning tags
-    return min(score, 1.0)
+score = 1.0 if run_in_sandbox(response) == expected_output else 0.0
 ```
-Good for: CQL, SQL, any domain with verifiable constraints. The key invariant: **invalid must always score lower than valid**.
+Good for: code generation (unit tests), SQL (execute and compare results).
+NeMo RL's `CodeEnvironment` does this.
 
 ---
 
-## Adding External Dependencies
+### Testing Locally (No GPU Needed)
+
+The reward logic lives in pure Python (`utils/cql_rewards.py`), testable on Mac:
+
+```bash
+# Run all reward unit tests (31 tests)
+python3 -m pytest utils/ -v
+
+# Test with first training example as golden query
+python3 scripts/test_rewards_local.py
+
+# Test with your own golden query — see full breakdown of each component
+python3 scripts/test_rewards_local.py \
+  --golden '#event_simpleName=ProcessRollup2 | where FileName="cmd.exe" | groupBy(ComputerName)'
+
+# Experiment with different weight distributions
+python3 scripts/test_rewards_local.py --golden '...' \
+  --weights '{"format":0.0,"structure":0.5,"fields":0.5,"execution":0.0}'
+```
+
+The test script shows full breakdowns — which functions matched/missed, which
+entities were hallucinated or missing, component-by-component scoring:
+
+```
+=== Perfect match (with think tags) ===
+Response: <think>Need process events for cmd.exe</think>
+          #event_simpleName=ProcessRollup2 | where FileName="cmd.exe" | groupBy(ComputerName)
+
+Format:    1.000  (both <think> and </think> found)
+Structure: 1.000  (shared: where, groupBy | missing: none)
+Fields:    1.000  (shared: processrollup2, filename, "cmd.exe", computername | missing: none)
+Combined:  1.000  (= 0.1*1.0 + 0.3*1.0 + 0.6*1.0)
+```
+
+---
+
+### Advanced: External Dependencies
 
 Your `__init__` can load anything — models, API clients, databases:
 
@@ -257,8 +435,6 @@ Your `__init__` can load anything — models, API clients, databases:
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class LogScaleRewardEnv(EnvironmentInterface[MyMetadata]):
     def __init__(self, cfg):
-        self.cfg = cfg
-        # Connect to LogScale sandbox for execution testing
         import requests
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {cfg['api_token']}"
@@ -278,24 +454,17 @@ Pass config via YAML:
 env:
   logscale_reward:
     num_workers: 4
-    api_token: ${oc.env:LOGSCALE_TOKEN}
     logscale_url: "https://cloud.community.humio.com"
     repo: "sandbox"
 ```
 
----
-
-## Parallelizing Heavy Rewards
+### Advanced: Parallelizing Heavy Rewards
 
 If reward computation is expensive (API calls, code execution), use worker actors:
 
 ```python
 @ray.remote
 class RewardWorker:
-    def __init__(self):
-        # Load model, connect to API, etc.
-        pass
-
     def score_batch(self, items):
         return [self.score_one(item) for item in items]
 
@@ -305,77 +474,48 @@ class ParallelRewardEnv(EnvironmentInterface[MyMetadata]):
         self.workers = [RewardWorker.remote() for _ in range(cfg["num_workers"])]
 
     def step(self, message_log_batch, metadata, **kwargs):
-        # Split work across workers
-        chunk_size = max(1, len(message_log_batch) // len(self.workers))
-        chunks = [
-            message_log_batch[i:i + chunk_size]
-            for i in range(0, len(message_log_batch), chunk_size)
-        ]
-        futures = [
-            self.workers[i % len(self.workers)].score_batch.remote(chunk)
-            for i, chunk in enumerate(chunks)
-        ]
+        chunks = [message_log_batch[i::len(self.workers)] for i in range(len(self.workers))]
+        futures = [w.score_batch.remote(c) for w, c in zip(self.workers, chunks)]
         results = []
         for batch_scores in ray.get(futures):
             results.extend(batch_scores)
-
-        rewards = torch.tensor(results).cpu()
-        # ... rest is same
-```
-
----
-
-## Custom Metrics for TensorBoard
-
-Everything you return in the `metrics` dict from `global_post_process_and_metrics` gets logged:
-
-```python
-def global_post_process_and_metrics(self, batch):
-    batch["rewards"] = batch["rewards"] * batch["is_end"]
-
-    rewards = batch["rewards"]
-    is_end = batch["is_end"]
-
-    metrics = {
-        # Standard
-        "accuracy": rewards.mean().item(),
-        "fraction_ended": is_end.float().mean().item(),
-        "mean_gen_length": batch["generation_lengths"].float().mean().item(),
-
-        # Custom — add whatever you want
-        "reward_std": rewards.std().item(),
-        "reward_max": rewards.max().item(),
-        "reward_min": rewards.min().item(),
-        "pct_perfect": (rewards == 1.0).float().mean().item(),
-        "pct_zero": (rewards == 0.0).float().mean().item(),
-    }
-
-    # Pass@k (fraction of prompts with at least one correct answer)
-    # If you have num_generations_per_prompt rollouts grouped together:
-    if "num_generations_per_prompt" in batch:
-        n = batch["num_generations_per_prompt"]
-        grouped = rewards.view(-1, n)
-        metrics["pass@k"] = (grouped.max(dim=1).values > 0.5).float().mean().item()
-
-    return batch, metrics
-```
-
-View in TensorBoard:
-```bash
-tensorboard --logdir logs/ --port 6006
+        # ... build EnvironmentReturn as usual
 ```
 
 ---
 
 ## Approach 2: NeMo Gym Resource Server (FastAPI)
 
-NeMo Gym (https://github.com/NVIDIA-NeMo/Gym) uses a different pattern: FastAPI HTTP servers that expose a `/verify` endpoint. NeMo RL can call these via the built-in `nemo_gym` environment adapter.
+NeMo Gym ([NVIDIA-NeMo/Gym](https://github.com/NVIDIA-NeMo/Gym)) uses a different
+pattern. Instead of a Ray actor, you write a **FastAPI HTTP server** that exposes
+a `/verify` endpoint. NeMo Gym (or NeMo RL via its `nemo_gym` adapter) sends
+each model output to your server and gets back a reward.
+
+```
+┌──────────────────┐     HTTP POST /verify      ┌─────────────────────────┐
+│  NeMo RL         │ ──────────────────────────► │  Your Resource Server   │
+│  (GRPO training) │     {response, prompt}      │  (FastAPI app)          │
+│                  │ ◄────────────────────────── │                         │
+│                  │     {reward: 0.85}           │  - parse response       │
+└──────────────────┘                              │  - compute reward       │
+                                                  │  - return score         │
+                                                  └─────────────────────────┘
+```
+
+### When to Use This Instead of Approach 1
+
+| Situation | Use |
+|---|---|
+| Reward is pure Python, fast to compute | Approach 1 (NeMo RL) |
+| Need external services (Docker, LLM judge, database) | Approach 2 (NeMo Gym) |
+| Want to test rewards via HTTP independently of training | Approach 2 (NeMo Gym) |
+| Multi-step agent tasks (tool use, browsing) | Approach 2 (NeMo Gym) |
+| Simple single-turn scoring | Approach 1 (NeMo RL) |
 
 ### Minimal Template
 
 ```python
-"""resources_servers/my_reward/app.py"""
-
+"""resources_servers/my_cql_reward/app.py"""
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
     BaseVerifyRequest,
@@ -384,46 +524,38 @@ from nemo_gym.base_resources_server import (
 )
 
 
-class MyResourcesServerConfig(BaseResourcesServerConfig):
-    name: str = "my_reward"
+class MyCQLServerConfig(BaseResourcesServerConfig):
+    name: str = "cql_reward"
 
 
-class MyResourcesServer(SimpleResourcesServer):
-    config: MyResourcesServerConfig
+class MyCQLResourcesServer(SimpleResourcesServer):
+    config: MyCQLServerConfig
 
     async def verify(self, body: BaseVerifyRequest) -> BaseVerifyResponse:
-        # body.response contains the model's full response (NeMoGymResponse object)
-        # body.responses_create_params has the original prompt
+        # body.response.output_text = the model's full text output
+        # body.responses_create_params.input = the original prompt messages
         model_output = body.response.output_text or ""
 
-        # ---- YOUR REWARD LOGIC HERE ----
-        reward = 1.0 if "correct answer" in model_output else 0.0
+        # --- Your reward logic ---
+        reward = 1.0 if "|" in model_output else 0.0  # has pipe operators?
 
         return BaseVerifyResponse(**body.model_dump(), reward=reward)
 
 
 if __name__ == "__main__":
-    MyResourcesServer.run_webserver()
+    MyCQLResourcesServer.run_webserver()
 ```
 
-### Key Differences from NeMo RL Environments
+### Adding Task-Specific Fields
 
-| NeMo RL `step()` | NeMo Gym `verify()` |
-|---|---|
-| Receives `list[LLMMessageLogType]` (batch) | Receives single `BaseVerifyRequest` |
-| Returns `EnvironmentReturn` (NamedTuple) | Returns `BaseVerifyResponse` with `reward: float` |
-| Ray actor, in-process | HTTP server, can run anywhere |
-| You handle batching | NeMo Gym handles batching/concurrency |
-
-### Extending with Custom Fields
-
-Add task-specific fields to the request/response (like the text_to_sql example in NeMo Gym):
+Subclass the request/response models to pass extra data:
 
 ```python
-from pydantic import BaseModel
+from pydantic import ConfigDict
 
 class CQLVerifyRequest(BaseVerifyRequest):
-    cql: str              # ground truth CQL
+    model_config = ConfigDict(extra="allow")
+    cql: str              # ground truth CQL query
     nl_query: str         # natural language question
     schema_context: str   # event type schema
 
@@ -431,73 +563,86 @@ class CQLVerifyResponse(BaseVerifyResponse):
     extracted_cql: str | None = None
     structure_score: float = 0.0
     fields_score: float = 0.0
+
+class CQLResourcesServer(SimpleResourcesServer):
+    async def verify(self, body: CQLVerifyRequest) -> CQLVerifyResponse:
+        model_output = body.response.output_text or ""
+        ground_truth = body.cql
+
+        # Reuse the same reward logic we test locally
+        from utils.cql_rewards import compute_combined_reward
+        result = compute_combined_reward(model_output, ground_truth)
+
+        return CQLVerifyResponse(
+            **body.model_dump(),
+            reward=result["reward"],
+            extracted_cql=result["extracted_cql"],
+            structure_score=result["structure"],
+            fields_score=result["fields"],
+        )
 ```
 
-### Using NeMo Gym Servers with NeMo RL
+### Running and Testing
 
-NeMo RL has a built-in `nemo_gym` environment that wraps any NeMo Gym resource server:
+```bash
+# Start the server
+python resources_servers/my_cql_reward/app.py
+# Listening on http://0.0.0.0:8080
+
+# Test with curl
+curl -X POST http://localhost:8080/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "responses_create_params": {"input": [{"role": "user", "content": "Find DNS requests"}]},
+    "response": {"output": [{"type": "message", "content": [{"type": "output_text", "text": "#event=DnsRequest | groupBy(DomainName)"}]}]},
+    "cql": "#event_simpleName=DnsRequest | groupBy(DomainName)"
+  }'
+# Returns: {"reward": 0.72, "structure_score": 1.0, "fields_score": 0.5, ...}
+```
+
+### Bridging NeMo Gym Servers into NeMo RL Training
+
+NeMo RL has a built-in `nemo_gym` adapter. In your YAML:
 
 ```yaml
 env:
   nemo_gym:
     model_name: ${policy.model_name}
-    base_urls: ["http://localhost:8080"]
-    initial_global_config_dict:
-      # NeMo Gym config goes here
+    base_urls: ["http://localhost:8080"]     # your resource server URL
+    initial_global_config_dict: {}           # NeMo Gym config
 ```
 
-This lets you write reward logic as an HTTP server (NeMo Gym pattern) but use it with NeMo RL's GRPO training. The `NemoGym` adapter in NeMo RL handles generation, token-level logprobs, and the training loop — your server just scores.
+The `NemoGym` adapter handles generation and training. Your server just scores.
 
-### Real Example: text_to_sql (from NeMo Gym repo)
+### Real Examples from NeMo Gym Repo
 
-See `resources_servers/text_to_sql/` in [NVIDIA-NeMo/Gym](https://github.com/NVIDIA-NeMo/Gym):
-- Extracts SQL from model response (code blocks or raw)
-- Uses LLM-as-judge for semantic equivalence checking
-- Supports swap-check to detect positional bias
-- Binary reward: 1.0 if equivalent, 0.0 otherwise
+| Server | What it does | Reward type |
+|--------|-------------|-------------|
+| `text_to_sql/` | LLM-as-judge SQL equivalence | Binary (0 or 1) with swap-check |
+| `code_gen/` | Code execution + unit tests | Binary (passes/fails) |
+| `math_with_judge/` | LLM judges math solutions | Binary |
+| `instruction_following/` | Checks format constraints | Multi-component |
 
-### When to Use Which
-
-**Use NeMo RL environments (Approach 1) when:**
-- Reward is pure Python (fast, no external calls)
-- You want simple single-file setup
-- You're doing GRPO training with NeMo RL
-
-**Use NeMo Gym resource servers (Approach 2) when:**
-- Reward needs external services (Docker sandbox, LLM judge, database)
-- You want to test rewards independently via HTTP
-- You're using NeMo Gym's rollout collection pipeline
-- You need multi-step agent evaluation
-
----
-
-## Existing Example: CQL Environment
-
-See `environments/cql_environment.py` — R1-style multi-component reward (~98 lines):
-- **Format reward** (0.1 weight): `<think>...</think>` tag presence → 0.0 / 0.5 / 1.0
-- **Structure reward** (0.3 weight): Jaccard of pipeline function names (right operations)
-- **Fields reward** (0.6 weight): F1 of tags, field names, string literals (right data)
-- **Execution reward** (0.0 weight): placeholder for Docker LogScale compilation
-
-Reward logic lives in `utils/cql_rewards.py` (pure Python, no GPU deps — testable on Mac).
-
-```python
-from utils.cql_rewards import compute_combined_reward
-
-result = compute_combined_reward(response, reference_cql, weights={"format": 0.1, "structure": 0.3, "fields": 0.6, "execution": 0.0})
-# result = {"reward": 0.84, "format": 1.0, "structure": 0.8, "fields": 0.9, "execution": 0.0, "extracted_cql": "...", "has_thinking": True}
-```
+Source: [`resources_servers/`](https://github.com/NVIDIA-NeMo/Gym/tree/main/resources_servers) in NVIDIA-NeMo/Gym.
 
 ---
 
 ## Checklist
 
+### NeMo RL Environment (Approach 1)
 - [ ] Class decorated with `@ray.remote(max_restarts=-1, max_task_retries=-1)`
 - [ ] Inherits `EnvironmentInterface[YourMetadata]`
-- [ ] `step()` returns `EnvironmentReturn` with **all 6 fields** including `answers`
+- [ ] `step()` returns `EnvironmentReturn` with **all 6 fields**
 - [ ] All tensors (`rewards`, `terminateds`) on **CPU**
-- [ ] `global_post_process_and_metrics()` multiplies `rewards * is_end`
+- [ ] `global_post_process_and_metrics()` includes `batch["rewards"] *= batch["is_end"]`
 - [ ] `shutdown()` method exists (can be empty)
 - [ ] Registered via `register_env("name", "module.ClassName")` before training starts
-- [ ] Config YAML has `env: your_name: num_workers: N`
-- [ ] Rewards bounded and consistent
+- [ ] YAML has both `env.your_name` and `data.default.env_name` pointing to it
+- [ ] Reward logic testable locally without GPU
+
+### NeMo Gym Resource Server (Approach 2)
+- [ ] Subclasses `SimpleResourcesServer`
+- [ ] Overrides `async def verify()` returning `BaseVerifyResponse` with `reward` field
+- [ ] Runs standalone: `python app.py` starts the HTTP server
+- [ ] Testable via `curl` or `pytest` without NeMo RL
+- [ ] If using with NeMo RL: `env.nemo_gym.base_urls` points to server
