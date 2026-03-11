@@ -35,21 +35,15 @@ def compute_format_reward(response: str) -> float:
 
     Returns float in [0, 1]:
       - 0.0: no think tags at all
-      - 0.5: partial (open only, wrong order, or empty/trivial thinking)
-      - 1.0: properly paired with substantive thinking (≥10 chars)
+      - 0.5: has one tag (<think> or </think>) but not both
+      - 1.0: has both <think> and </think>
     """
     has_open = "<think>" in response
     has_close = "</think>" in response
 
     if has_open and has_close:
-        open_pos = response.index("<think>")
-        close_pos = response.index("</think>")
-        if close_pos > open_pos:
-            # Check thinking is substantive (prevent empty <think></think> hacking)
-            thinking = response[open_pos + len("<think>"):close_pos].strip()
-            return 1.0 if len(thinking) >= 10 else 0.5
-        return 0.5
-    elif has_open:
+        return 1.0
+    elif has_open or has_close:
         return 0.5
     return 0.0
 

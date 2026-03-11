@@ -125,42 +125,50 @@ This is the most important local step — validate your reward function before d
 python scripts/test_rewards_local.py
 ```
 
-This runs the **exact same reward logic** the GPU training will use, on real data from `data/train.jsonl`. No NeMo RL, no Ray, no GPU needed.
+This runs the **exact same reward logic** the GPU training will use (`utils/cql_rewards.py`), on real data from `data/train.jsonl`. No NeMo RL, no Ray, no GPU needed.
 
 Output:
 ```
-Testing reward on 10 examples from data/train.jsonl
+Reward weights: format=0.2, ngram=0.8, execution=0.0
 
-  #   Reward  Valid  BiSim  Query (first 60 chars)
--------------------------------------------------------------------
-  1   -0.400  False  1.000  EmailEvents | | where Timestamp > ...
-  2    1.000   True  1.000  VMComputer | | where PhysicalMemory...
-  ...
+=== Ground truth queries (no <think> tags) — 10 examples ===
+  #   Total    Fmt  Ngram  Query (first 60 chars)
+------------------------------------------------------------------------------------------
+  1   0.800   0.00   1.00  EmailEvents | | where Timestamp > ago(7d) ...
+  2   0.800   0.00   1.00  DeviceNetworkEvents | | where Timestamp ...
+Mean: 0.800  (format=0.0 expected since no think tags)
 
-=== Broken query tests ===
-Empty string                -0.500  False  0.000  Empty query
-Just text                    0.400   True  0.000  -
-Unclosed paren              -0.500  False  0.000  Unclosed '('...
+=== Same queries wrapped in <think>...</think> ===
+  #   Total    Fmt  Ngram  Think?
+------------------------------------------------------------------------------------------
+  1   1.000   1.00   1.00  True
+Mean: 1.000  (format=1.0 expected with proper tags)
 
-=== Invariant check: invalid must always score < valid ===
-  Valid reward:   1.000
-  Invalid reward: -0.500
-  Invariant holds: ✓ YES
+=== Edge cases ===
+Empty string                   0.000   0.00   0.00  ...
+Think but no CQL after         0.200   1.00   0.00  ...
+Perfect with think             1.000   1.00   1.00  ...
+
+=== Incentive check: does <think> get higher reward? ===
+  Bare CQL:         reward=0.800 (format=0.0)
+  With <think> tags: reward=1.000 (format=1.0)
+  Delta: +0.200 ✓ think tags rewarded
 ```
 
 Options:
 ```bash
-python scripts/test_rewards_local.py --n 50           # Test 50 examples
-python scripts/test_rewards_local.py --data data/val.jsonl  # Test on validation set
+python scripts/test_rewards_local.py --n 50                    # Test 50 examples
+python scripts/test_rewards_local.py --data data/val.jsonl     # Test on validation set
+python scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.7,"execution":0.0}'  # Custom weights
 ```
 
 ### How to iterate on rewards
 
-1. Edit `compute_reward()` in `scripts/test_rewards_local.py`
-2. Run `python scripts/test_rewards_local.py`
-3. Check: are valid queries always scoring higher than invalid ones?
-4. Check: is the reward spread wide enough for GRPO to learn? (If everything scores 0.95-1.0, there's no gradient signal)
-5. Once happy, copy the logic to `environments/cql_environment.py`
+1. Edit `utils/cql_rewards.py` (the reward functions)
+2. Run `python scripts/test_rewards_local.py` to see the effect
+3. Check: are responses with `<think>` tags scoring higher?
+4. Check: is the reward spread wide enough for GRPO to learn? (If everything scores ~0.8, there's no gradient signal)
+5. Both the local test and the real `CQLEnvironment` import from the same file — no copy-paste needed
 
 ---
 
@@ -239,11 +247,12 @@ kill %1
 ## Project files you'll touch most
 
 ```
-environments/cql_environment.py   ← YOUR REWARD FUNCTION (edit this)
+utils/cql_rewards.py              ← YOUR REWARD FUNCTIONS (edit this)
 scripts/test_rewards_local.py     ← Test rewards locally (run this)
-configs/cql_nemo_rl_nemotron30b.yaml  ← GRPO hyperparameters (tune this)
+configs/cql_nemo_rl_nemotron30b.yaml  ← GRPO hyperparameters + reward weights (tune this)
 configs/sft_cql_config.yaml       ← SFT hyperparameters (tune this)
 data/train.jsonl                  ← Training data (inspect this)
+resources/cql_system_prompt.txt   ← System prompt with <think> examples (edit this)
 ```
 
 ---
@@ -254,25 +263,28 @@ data/train.jsonl                  ← Training data (inspect this)
 # 1. Activate venv
 source .venv/bin/activate
 
-# 2. Edit your reward
-vim environments/cql_environment.py
+# 2. Edit your reward logic
+vim utils/cql_rewards.py
 
-# 3. Test it
+# 3. Test it locally
 python scripts/test_rewards_local.py
 
-# 4. Run unit tests to make sure nothing broke
+# 4. Try different weights
+python scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.5,"execution":0.2}'
+
+# 5. Run unit tests to make sure nothing broke
 python -m pytest utils/test_cql_validator.py utils/test_cql_tokenizer.py -v
 
-# 5. Tweak config
+# 6. Tweak config / reward weights
 vim configs/cql_nemo_rl_nemotron30b.yaml
 
-# 6. Validate config
+# 7. Validate config
 python scripts/run_grpo_cql.py --dry-run
 
-# 7. Commit and push
+# 8. Commit and push
 git add -A && git commit -m "Improve reward function" && git push
 
-# 8. SSH to cluster and submit
+# 9. SSH to cluster and submit
 ssh cluster
 cd cql_rlvr && git pull
 sbatch scripts/slurm/grpo.sh

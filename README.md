@@ -36,30 +36,41 @@ python3 scripts/run_sft_cql.py --config configs/sft_cql_full_config.yaml --dry-r
 
 ### Step 1 — Get NeMo RL on your GPU node
 
-NeMo RL **cannot be installed with pip**. Use the NGC container:
+NeMo RL **cannot be installed with pip**. Two options — **source install is recommended** for debugging:
 
+**Option A — Source install (recommended for development)**
 ```bash
-# Pull the container
+# Clone NeMo RL
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+cd nemo-rl && uv venv && source .venv/bin/activate
+
+# Clone this project alongside (or inside)
+git clone git@github.com:aboros98/nemo-rl-toy-example.git cql_rlvr
+
+# Set PYTHONPATH so both projects can import each other
+export PYTHONPATH=$(pwd)/cql_rlvr:$PYTHONPATH
+
+# Run training
+uv run python cql_rlvr/scripts/run_sft_cql.py --config cql_rlvr/configs/sft_cql_config.yaml
+```
+
+Why source: you can `print()` / `breakpoint()` anywhere in NeMo RL internals, reward functions, or data processors. You WILL need this.
+
+**Option B — NGC container (for SLURM / reproducible deployment)**
+```bash
 docker pull nvcr.io/nvidia/nemo-rl:v0.5.0
 
-# Interactive shell (for debugging)
 docker run --gpus all -it --rm \
   --shm-size=16g \
   -v $(pwd):/workspace/cql_rlvr \
   nvcr.io/nvidia/nemo-rl:v0.5.0
 
-# Inside the container, everything is ready:
+# Inside the container:
 cd /workspace/cql_rlvr
 uv run python scripts/run_sft_cql.py --config configs/sft_cql_config.yaml
 ```
 
-Alternative — source install for development:
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
-cd nemo-rl && uv venv
-# Then copy this project into the nemo-rl directory or adjust sys.path
-```
+Switch to Docker only when you're done debugging and want reproducible SLURM runs.
 
 ### Step 2 — SFT warmup (recommended first)
 
@@ -101,8 +112,7 @@ tensorboard --logdir logs/ --port 6006
 ```
 
 Key metrics to watch:
-- `accuracy` — fraction of syntactically valid CQL (should increase)
-- `reward/mean` — average reward (should increase)
+- `mean_reward` — average combined reward (should increase)
 - `generation_lengths` — watch for length hacking (shouldn't explode)
 - `fraction_of_samples_properly_ended` — should stay high (>0.9)
 
@@ -145,23 +155,90 @@ CONTAINER=nvcr.io/nvidia/nemo-rl:v0.6.0 sbatch scripts/slurm/grpo.sh
 
 During GRPO, for each prompt NeMo RL generates N rollouts (default: 8), then asks the **environment** to score them.
 
-The reward flow:
 ```
-Prompt → vLLM generates 8 CQL queries → CQLEnvironment.step() scores each → GRPO computes advantages
+Prompt → vLLM generates 8 responses → CQLEnvironment.step() scores each → GRPO computes advantages
 ```
 
-Our environment (`environments/cql_environment.py`, ~80 lines):
-- Extracts the assistant's response from each conversation
-- Runs it through `utils/cql_validator.validate()`
-- Returns **1.0** for valid CQL, **0.0** for invalid
-- `global_post_process_and_metrics()` masks rewards for incomplete sequences and logs accuracy to TensorBoard
+### Three reward components (R1-style)
 
-**To change the reward** — edit `environments/cql_environment.py` or create a new environment. See [docs/reward_environments.md](docs/reward_environments.md) for the full guide.
+| Component | Weight | What it measures | Range |
+|-----------|--------|-----------------|-------|
+| **N-gram similarity** | 0.8 | Bigram F1 between generated CQL and reference | 0.0 – 1.0 |
+| **Format (think tags)** | 0.2 | Does the model use `<think>...</think>` reasoning? | 0.0 / 0.5 / 1.0 |
+| **Execution** | 0.0 | Placeholder — Docker LogScale compilation check | 0.0 always |
 
-**To test reward changes locally** — edit `compute_reward()` in `scripts/test_rewards_local.py` and run:
+**Combined reward** = `0.8 × ngram + 0.2 × format + 0.0 × execution` (configurable in YAML)
+
+**Format reward scoring:**
+- `0.0` — no `<think>` or `</think>` tags
+- `0.5` — has one tag but not both
+- `1.0` — has both `<think>` and `</think>`
+
+**Example rewards:**
+| Response | Format | N-gram | Total |
+|----------|--------|--------|-------|
+| `<think>reasoning</think>\n<perfect CQL>` | 1.0 | 1.0 | **1.0** |
+| `<perfect CQL>` (no think tags) | 0.0 | 1.0 | **0.8** |
+| `<think>reasoning</think>\n<wrong CQL>` | 1.0 | 0.2 | **0.36** |
+| `<think>only thinking, no CQL` | 0.5 | 0.0 | **0.10** |
+| empty response | 0.0 | 0.0 | **0.0** |
+
+### Architecture
+
+```
+utils/cql_rewards.py              ← Pure Python reward logic (no GPU deps)
+  ├── compute_format_reward()     ← Think tag scoring
+  ├── compute_ngram_reward()      ← Bigram similarity
+  ├── compute_execution_reward()  ← Placeholder for Docker LogScale
+  └── compute_combined_reward()   ← Weighted sum of all three
+
+environments/cql_environment.py   ← NeMo RL wrapper (imports from cql_rewards.py)
+scripts/test_rewards_local.py     ← Local testing (imports from cql_rewards.py)
+```
+
+Both the local test script and the real environment import from the **same** `utils/cql_rewards.py` — so local testing always matches production.
+
+### Changing reward weights
+
+In `configs/cql_nemo_rl_nemotron30b.yaml`:
+```yaml
+env:
+  cql:
+    num_workers: 8
+    reward_weights:
+      format: 0.2      # think tag compliance
+      ngram: 0.8        # bigram similarity to reference
+      execution: 0.0    # set >0 when Docker LogScale is ready
+```
+
+Or override from CLI:
 ```bash
-python3 scripts/test_rewards_local.py
+OVERRIDES="++env.cql.reward_weights.format=0.3 ++env.cql.reward_weights.ngram=0.7" sbatch scripts/slurm/grpo.sh
 ```
+
+### Testing rewards locally (Mac, no GPU)
+
+```bash
+# Default weights
+python3 scripts/test_rewards_local.py
+
+# Custom weights
+python3 scripts/test_rewards_local.py --weights '{"format":0.3,"ngram":0.7,"execution":0.0}'
+
+# More examples
+python3 scripts/test_rewards_local.py --n 50 --data data/val.jsonl
+```
+
+**To change the reward logic** — edit `utils/cql_rewards.py`, then re-run the test script. Both local and production use the same file.
+
+### Adding the execution reward (Docker LogScale)
+
+When you have a Docker container that can compile CQL queries:
+
+1. Edit `compute_execution_reward()` in `utils/cql_rewards.py` — add HTTP call to Docker
+2. Test locally: `python3 scripts/test_rewards_local.py --weights '{"format":0.1,"ngram":0.3,"execution":0.6}'`
+3. Update config: set `execution: 0.6` (or whatever weight you choose)
+4. Push and retrain
 
 ---
 
@@ -216,6 +293,7 @@ cql_rlvr/
 │   ├── sft_cql_full_config.yaml           # SFT full FT
 │   └── cql_nemo_rl_config.yaml            # Dummy validation
 ├── utils/
+│   ├── cql_rewards.py          # Reward functions (format + ngram + execution)
 │   ├── cql_validator.py         # CQL syntax validator
 │   ├── cql_tokenizer.py         # CQL semantic tokenizer
 │   ├── cql_data_processor.py    # NeMo RL data processor (system/user/assistant)
